@@ -30,7 +30,9 @@ PDF_SCRIPT = ROOT / "scripts" / "generate_pdf.py"
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".opus", ".mp4", ".aac", ".wma"}
+AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".opus", ".mp4", ".aac",
+                  ".wma", ".mpeg", ".mpg", ".mpga", ".mp2", ".webm", ".mkv", ".mov",
+                  ".avi", ".wmv", ".aiff", ".aif", ".amr", ".3gp", ".m4b", ".m4v", ".ts"}
 
 STEPS = ("transcription", "synthese", "pdf")
 

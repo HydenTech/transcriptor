@@ -19,6 +19,12 @@ import traceback
 from pathlib import Path
 from typing import Any, Optional
 
+# Sous pythonw.exe, sys.stdout et sys.stderr valent None : la moindre
+# ecriture d'une bibliotheque tierce leverait une exception.
+for _flux in ("stdout", "stderr"):
+    if getattr(sys, _flux, None) is None:
+        setattr(sys, _flux, open(os.devnull, "w", encoding="utf-8"))
+
 APP_DIR = Path(__file__).resolve().parent
 CLAUDE_MD = APP_DIR / "CLAUDE.md"
 PDF_SCRIPT = APP_DIR / "scripts" / "generate_pdf.py"
@@ -26,7 +32,9 @@ PDF_SCRIPT = APP_DIR / "scripts" / "generate_pdf.py"
 DOCUMENTS = Path(os.environ.get("USERPROFILE", Path.home())) / "Documents"
 SORTIE = Path(os.environ.get("TRANSCRIPTOR_SORTIE", DOCUMENTS / "Transcriptor"))
 
-AUDIO_EXT = (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".opus", ".mp4", ".aac", ".wma")
+AUDIO_EXT = (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".opus", ".mp4", ".aac",
+             ".wma", ".mpeg", ".mpg", ".mpga", ".mp2", ".webm", ".mkv", ".mov",
+             ".avi", ".wmv", ".aiff", ".aif", ".amr", ".3gp", ".m4b", ".m4v", ".ts")
 STEPS = ("transcription", "synthese", "pdf")
 
 # Masque la fenêtre noire des sous-processus.
@@ -38,17 +46,40 @@ _model_cache: dict[str, Any] = {}
 # ----------------------------------------------------------------------
 # CUDA : les DLL arrivent par pip, il faut les déclarer à Windows
 # ----------------------------------------------------------------------
+def dossiers_dll_nvidia() -> list[Path]:
+    """Les roues pip nvidia-* rangent leurs binaires sous nvidia/<paquet>/bin
+    sur Windows et nvidia/<paquet>/lib sur Linux. On balaie les deux."""
+    try:
+        import nvidia
+    except Exception:
+        return []
+
+    trouves: list[Path] = []
+    for racine in (Path(p) for p in getattr(nvidia, "__path__", [])):
+        if not racine.is_dir():
+            continue
+        for paquet in sorted(racine.iterdir()):
+            for sous in ("bin", "lib"):
+                d = paquet / sous
+                if d.is_dir() and (any(d.glob("*.dll")) or any(d.glob("*.so*"))):
+                    trouves.append(d)
+    return trouves
+
+
 def enregistrer_dll_cuda() -> None:
-    if not hasattr(os, "add_dll_directory"):
+    dossiers = dossiers_dll_nvidia()
+    if not dossiers:
         return
-    for module in ("nvidia.cublas.lib", "nvidia.cudnn.lib"):
+    for d in dossiers:
         try:
-            mod = __import__(module, fromlist=["__file__"])
-            dossier = Path(mod.__file__).parent
-            if dossier.is_dir():
-                os.add_dll_directory(str(dossier))
-        except Exception:
+            os.add_dll_directory(str(d))  # type: ignore[attr-defined]
+        except (AttributeError, OSError):
             pass
+    # CTranslate2 resout cublas64_12.dll par l'ordre de recherche standard,
+    # qui ignore add_dll_directory pour ses imports implicites : le PATH,
+    # lui, est toujours consulte.
+    os.environ["PATH"] = (os.pathsep.join(str(d) for d in dossiers)
+                          + os.pathsep + os.environ.get("PATH", ""))
 
 
 def hhmm(secondes: float) -> str:
@@ -70,6 +101,7 @@ class Traitement:
         self.usage: dict[str, Any] = {}
         self.fichiers: dict[str, str] = {}
         self.etapes = {n: {"statut": "attente", "avancement": 0.0, "detail": ""} for n in STEPS}
+        self._dernier_envoi = 0.0
 
     def instantane(self) -> dict[str, Any]:
         return {
@@ -87,6 +119,12 @@ class Traitement:
             e["avancement"] = max(0.0, min(1.0, avancement))
         if detail is not None:
             e["detail"] = detail
+        # Un cours de 2 h produit des milliers de segments. Sans ce frein,
+        # autant d'appels evaluate_js inter-threads figent la fenetre.
+        maintenant = time.time()
+        if statut is None and maintenant - self._dernier_envoi < 0.4:
+            return
+        self._dernier_envoi = maintenant
         self.notifier(self.instantane())
 
     def echec(self, etape: str, message: str) -> None:
@@ -109,21 +147,46 @@ def amorce(matiere: str, termes: str) -> str:
     return texte[:900]  # Whisper tronque au-delà d'environ 224 tokens.
 
 
-def charger_modele(nom: str):
-    if nom in _model_cache:
-        return _model_cache[nom]
+def charger_modele(nom: str, *, cpu: bool = False):
+    cle = f"{nom}|{'cpu' if cpu else 'cuda'}"
+    if cle in _model_cache:
+        return _model_cache[cle]
     from faster_whisper import WhisperModel
 
-    try:
-        _model_cache[nom] = WhisperModel(nom, device="cuda", compute_type="float16")
-    except Exception:
-        _model_cache[nom] = WhisperModel(nom, device="cpu", compute_type="int8")
-    return _model_cache[nom]
+    if not cpu:
+        try:
+            _model_cache[cle] = WhisperModel(nom, device="cuda", compute_type="float16")
+            return _model_cache[cle]
+        except Exception:
+            cle = f"{nom}|cpu"
+            if cle in _model_cache:
+                return _model_cache[cle]
+    _model_cache[cle] = WhisperModel(nom, device="cpu", compute_type="int8")
+    return _model_cache[cle]
+
+
+def _panne_cuda(exc: Exception) -> bool:
+    """CTranslate2 ne signale l'absence des DLL qu'au premier calcul reel,
+    donc bien apres la construction du modele."""
+    m = str(exc).lower()
+    return any(x in m for x in ("cublas", "cudnn", "cuda", "libcu", "gpu"))
 
 
 def transcrire(t: Traitement) -> Path:
-    t.maj("transcription", statut="en_cours", detail="Chargement du modèle")
-    modele = charger_modele(t.options["modele"])
+    try:
+        return _transcrire(t, cpu=False)
+    except Exception as exc:  # noqa: BLE001
+        if not _panne_cuda(exc):
+            raise
+    t.maj("transcription", statut="en_cours", avancement=0.0,
+          detail="CUDA indisponible — reprise sur le processeur")
+    return _transcrire(t, cpu=True)
+
+
+def _transcrire(t: Traitement, *, cpu: bool) -> Path:
+    t.maj("transcription", statut="en_cours",
+          detail="Chargement du modèle" + (" (processeur)" if cpu else ""))
+    modele = charger_modele(t.options["modele"], cpu=cpu)
 
     t.maj("transcription", detail="Analyse de l'audio")
     segments, info = modele.transcribe(
@@ -294,9 +357,13 @@ class Passerelle:
 
     def _decrire(self, chemin: str) -> Optional[dict[str, Any]]:
         p = Path(chemin)
-        if not p.exists() or p.suffix.lower() not in AUDIO_EXT:
-            return {"erreur": f"Format {p.suffix or 'inconnu'} non pris en charge. "
-                              "Utilise MP3, WAV, M4A, OGG, FLAC ou OPUS."}
+        if not p.is_file():
+            return {"erreur": "Fichier introuvable."}
+        # FFmpeg lit bien plus de formats que la liste ci-dessus : on laisse
+        # passer, c'est le decodage qui tranchera avec un message clair.
+        if p.suffix.lower() not in AUDIO_EXT and p.stat().st_size < 4096:
+            return {"erreur": f"Fichier {p.suffix or 'sans extension'} trop petit "
+                              "pour un enregistrement audio."}
         return {"chemin": str(p), "nom": p.name,
                 "taille": round(p.stat().st_size / 1048576)}
 
@@ -367,9 +434,18 @@ class Passerelle:
 
 def _lisible(exc: Exception) -> str:
     message = str(exc).strip() or exc.__class__.__name__
-    if "CUDA" in message or "cudnn" in message.lower():
-        message += " — la transcription bascule normalement sur le processeur, " \
-                   "vérifie le pilote NVIDIA si c'est trop lent."
+    bas = message.lower()
+    if "invalid data" in bas or "moov atom" in bas or "does not contain" in bas \
+            or "no such file" in bas or "av." in bas.split(":")[0]:
+        message = ("Ce fichier n'a pas pu etre decode. Convertis-le en MP3 ou WAV, "
+                   "puis relance. (" + message[:120] + ")")
+    if "cublas" in bas or "cudnn" in bas:
+        message += (" — les bibliothèques CUDA de pip sont introuvables. "
+                    "Réinstalle-les : pip install --force-reinstall "
+                    "nvidia-cublas-cu12 \"nvidia-cudnn-cu12>=9,<10\"")
+    elif "cuda" in bas:
+        message += (" — la transcription bascule sur le processeur, "
+                    "vérifie le pilote NVIDIA si c'est trop lent.")
     return message[:400]
 
 
@@ -388,6 +464,12 @@ def main() -> None:
         background_color="#EDEFE9",
     )
     webview.start()
+
+    # WebView2 verrouille son dossier de donnees. Un processus fantome laisse
+    # apres la fermeture empeche le lancement suivant : la fenetre s'ouvre
+    # puis se fige. On coupe net plutot que d'attendre les threads restants.
+    sys.stdout.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
