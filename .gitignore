@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Environnement / secrets
+.env
+*.local
+
+# Sorties de travail
+cours/*
+!cours/.gitkeep
+*.log
+erreur.txt
+
+# Audio et modèles (jamais versionnés)
+*.mp3
+*.wav
+*.m4a
+*.ogg
+*.flac
+*.opus
+*.bin
+*.pt
+models/
+
+# Sorties générées
+*.pdf
+transcription.txt
+
+# OS / éditeurs
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

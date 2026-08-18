@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Transcriptor</title>
+<style>
+:root{
+  --paper:#EDEFE9; --card:#FFFFFF; --ink:#14203A; --ink-2:#5C6675;
+  --rule:#D5DACE; --rule-2:#E6E9E1;
+  --hi-yellow:#E9F660; --hi-pink:#FFA6C9; --hi-cyan:#93E2E8; --red:#C2412C;
+  --display:"Bahnschrift","Segoe UI Variable Display","Segoe UI",sans-serif;
+  --body:"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;
+  --mono:"Cascadia Mono","Consolas",ui-monospace,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  background:var(--paper);color:var(--ink);font-family:var(--body);
+  font-size:15px;line-height:1.55;padding:34px 32px 44px;
+  overflow-y:auto;-webkit-user-select:none;user-select:none;cursor:default;
+}
+.wrap{max-width:760px;margin:0 auto}
+:focus-visible{outline:2.5px solid var(--ink);outline-offset:3px;border-radius:2px}
+
+/* signature : le trait de surligneur */
+.swipe{position:relative;isolation:isolate;display:inline-block}
+.swipe::before{
+  content:"";position:absolute;left:-.14em;right:-.14em;top:.14em;bottom:.02em;
+  background:var(--hi-yellow);mix-blend-mode:multiply;z-index:-1;
+  clip-path:polygon(0 9%,100% 0,99.4% 91%,.6% 100%);
+  transform-origin:left center;
+  transform:rotate(-.5deg) skewX(-9deg) scaleX(var(--fill,1));
+  transition:transform .5s cubic-bezier(.22,1,.36,1);
+}
+.swipe--pink::before{background:var(--hi-pink)}
+.swipe--cyan::before{background:var(--hi-cyan)}
+
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.17em;
+  text-transform:uppercase;color:var(--ink-2);margin:0 0 14px}
+h1{font-family:var(--display);font-weight:600;font-size:40px;line-height:1.06;
+  letter-spacing:-.015em;margin:0 0 12px;max-width:15ch}
+.lede{color:var(--ink-2);max-width:54ch;margin:0 0 26px}
+
+.panel{background:var(--card);border:1px solid var(--rule);border-radius:3px;
+  padding:24px;margin-bottom:16px}
+.panel[hidden]{display:none}
+.panel-title{font-family:var(--mono);font-size:11px;letter-spacing:.15em;
+  text-transform:uppercase;color:var(--ink-2);margin:0 0 16px}
+
+.pick{border:1.5px dashed var(--rule);border-radius:3px;background:#FCFDFA;
+  padding:30px 20px;text-align:center;cursor:pointer;transition:.15s}
+.pick:hover{border-color:var(--ink);background:#F7FAF0}
+.pick strong{font-family:var(--display);font-weight:600;font-size:18px;
+  display:block;margin-bottom:4px}
+.pick span{color:var(--ink-2);font-size:13.5px}
+.pick.filled{text-align:left;padding:18px 20px;border-style:solid;border-color:var(--ink)}
+.filename{font-family:var(--mono);font-size:13px;word-break:break-all}
+
+.fields{display:grid;grid-template-columns:1fr 1fr;gap:15px;margin-top:20px}
+.field{display:flex;flex-direction:column;gap:6px}
+.field.wide{grid-column:1/-1}
+label{font-size:13px;font-weight:600}
+.hint{font-size:12px;color:var(--ink-2);font-weight:400;line-height:1.4;margin:0}
+input,select,textarea{font-family:var(--body);font-size:14.5px;color:var(--ink);
+  border:1px solid var(--rule);border-radius:2px;background:#fff;padding:8px 10px;
+  width:100%;-webkit-user-select:text;user-select:text}
+textarea{resize:vertical;min-height:60px;line-height:1.45}
+input:focus,select:focus,textarea:focus{border-color:var(--ink)}
+
+.go{margin-top:20px;width:100%;border:none;border-radius:2px;background:var(--ink);
+  color:#fff;font-family:var(--display);font-weight:600;font-size:16px;padding:13px;
+  cursor:pointer;transition:opacity .15s}
+.go:hover{opacity:.88}
+.go:disabled{opacity:.32;cursor:not-allowed}
+
+ol.steps{list-style:none;margin:0;padding:0}
+ol.steps li{display:grid;grid-template-columns:24px 1fr auto;align-items:baseline;
+  gap:12px;padding:14px 0;border-top:1px solid var(--rule-2)}
+ol.steps li:first-child{border-top:none}
+.num{font-family:var(--mono);font-size:12px;color:var(--ink-2)}
+.step-label{font-family:var(--display);font-weight:600;font-size:18px}
+.step-detail{font-family:var(--mono);font-size:12px;color:var(--ink-2);text-align:right}
+li[data-statut="attente"] .step-label{color:#A8AFA2}
+li[data-statut="erreur"] .step-detail{color:var(--red)}
+
+.tabs{display:flex;gap:4px;margin-bottom:16px}
+.tab{font-family:var(--mono);font-size:11.5px;letter-spacing:.07em;text-transform:uppercase;
+  border:1px solid var(--rule);background:transparent;color:var(--ink-2);
+  padding:6px 12px;border-radius:2px;cursor:pointer}
+.tab[aria-selected="true"]{background:var(--ink);border-color:var(--ink);color:#fff}
+.view{max-height:46vh;overflow:auto;border:1px solid var(--rule-2);border-radius:2px;
+  padding:20px;-webkit-user-select:text;user-select:text}
+.view pre{white-space:pre-wrap;font-family:var(--mono);font-size:12.5px;
+  line-height:1.65;margin:0}
+
+.md h1,.md h2,.md h3{font-family:var(--display);font-size:19px;margin:22px 0 9px;
+  letter-spacing:-.01em}
+.md h4{font-family:var(--display);font-size:15.5px;margin:18px 0 7px}
+.md p{margin:8px 0}
+.md ul,.md ol{margin:7px 0;padding-left:19px}
+.md li{margin:3px 0}
+.md code{font-family:var(--mono);font-size:.87em;background:#F1F3ED;padding:1px 5px;
+  border-radius:2px}
+.md pre{background:#F7F8F4;border:1px solid var(--rule-2);padding:11px;overflow:auto;
+  border-radius:2px}
+.md pre code{background:none;padding:0}
+.md blockquote{margin:9px 0;padding:7px 13px;border-left:3px solid var(--hi-yellow);
+  background:#FBFCF6}
+.md table{border-collapse:collapse;width:100%;margin:11px 0;font-size:13.5px}
+.md th{background:var(--ink);color:#fff;text-align:left;padding:6px 9px;font-weight:600}
+.md td{border:1px solid var(--rule-2);padding:5px 9px;vertical-align:top}
+.md hr{border:none;border-top:1px solid var(--rule);margin:20px 0}
+.md details{margin:5px 0;padding:7px 11px;background:#F7F8F4;border-radius:2px}
+.md summary{cursor:pointer;font-weight:600;font-size:13.5px}
+
+.actions{display:flex;gap:8px;margin-top:16px;flex-wrap:wrap}
+.action{font-family:var(--mono);font-size:12px;color:var(--ink);background:transparent;
+  border:1px solid var(--ink);padding:8px 14px;border-radius:2px;cursor:pointer;
+  transition:.15s}
+.action:hover{background:var(--ink);color:#fff}
+.action:disabled{opacity:.3;cursor:not-allowed}
+.action--fort{background:var(--ink);color:#fff}
+.action--fort:hover{opacity:.85}
+.usage{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);margin-top:13px}
+
+.alert{border-left:3px solid var(--red);background:#FDF4F2;padding:12px 15px;
+  margin-top:15px;font-size:14px;-webkit-user-select:text;user-select:text}
+
+@media (max-width:600px){
+  .fields{grid-template-columns:1fr}
+  ol.steps li{grid-template-columns:22px 1fr;row-gap:2px}
+  .step-detail{grid-column:2;text-align:left}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">Transcriptor</p>
+    <h1>De l'auditoire à la <span class="swipe">fiche</span>, sans rien retaper.</h1>
+    <p class="lede">Choisis l'enregistrement du cours. Il est transcrit sur ta carte
+      graphique, puis mis en forme selon les règles du fichier CLAUDE.md.</p>
+  </header>
+
+  <section class="panel" id="panel-choix">
+    <p class="panel-title">Le cours</p>
+
+    <div class="pick" id="pick" tabindex="0" role="button">
+      <strong>Choisir l'enregistrement</strong>
+      <span>MP3, WAV, M4A, OGG, FLAC ou OPUS — jusqu'à trois heures</span>
+    </div>
+
+    <div class="fields">
+      <div class="field">
+        <label for="matiere">Matière</label>
+        <input id="matiere" placeholder="Programmation Java" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="modele">Modèle de transcription</label>
+        <select id="modele">
+          <option value="large-v3">large-v3 — le plus précis</option>
+          <option value="large-v3-turbo">large-v3-turbo — trois fois plus rapide</option>
+          <option value="medium">medium — dépannage sans GPU</option>
+        </select>
+      </div>
+      <div class="field wide">
+        <label for="termes">Vocabulaire du chapitre</label>
+        <textarea id="termes" placeholder="ArrayList&lt;String&gt;, HashMap, try/catch, throws Exception, System.out.println, polymorphisme"></textarea>
+        <p class="hint">Whisper recopie la casse qu'il lit ici. Écris les termes
+          exactement comme tu veux les retrouver — c'est ce qui sauve le camelCase.
+          Une trentaine de termes maximum.</p>
+      </div>
+    </div>
+
+    <button class="go" id="go" disabled>Transcrire et résumer</button>
+    <div id="erreur-choix"></div>
+  </section>
+
+  <section class="panel" id="panel-etapes" hidden>
+    <p class="panel-title">En cours</p>
+    <ol class="steps">
+      <li data-etape="transcription" data-statut="attente">
+        <span class="num">01</span>
+        <span class="step-label"><span class="swipe" style="--fill:0">Transcription</span></span>
+        <span class="step-detail"></span>
+      </li>
+      <li data-etape="synthese" data-statut="attente">
+        <span class="num">02</span>
+        <span class="step-label"><span class="swipe swipe--pink" style="--fill:0">Synthèse</span></span>
+        <span class="step-detail"></span>
+      </li>
+      <li data-etape="pdf" data-statut="attente">
+        <span class="num">03</span>
+        <span class="step-label"><span class="swipe swipe--cyan" style="--fill:0">Mise en page</span></span>
+        <span class="step-detail"></span>
+      </li>
+    </ol>
+    <div id="erreur-etapes"></div>
+  </section>
+
+  <section class="panel" id="panel-resultat" hidden>
+    <p class="panel-title">Support de révision</p>
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" data-vue="md" aria-selected="true">Fiche</button>
+      <button class="tab" role="tab" data-vue="txt" aria-selected="false">Transcription</button>
+    </div>
+    <div class="view"><div class="md" id="viewer"></div></div>
+    <div class="actions">
+      <button class="action action--fort" id="ouvrir-pdf">Ouvrir le PDF</button>
+      <button class="action" id="ouvrir-dossier">Ouvrir le dossier</button>
+      <button class="action" id="copier">Copier le Markdown</button>
+      <button class="action" id="encore">Un autre cours</button>
+    </div>
+    <p class="usage" id="usage"></p>
+  </section>
+
+</div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let api = null, choisi = null, cache = {md:"", txt:""};
+
+window.addEventListener("pywebviewready", async () => {
+  api = window.pywebview.api;
+  const initial = await api.fichier_initial();
+  if (initial && initial.chemin) retenir(initial);
+});
+
+/* ---------- choix du fichier ---------- */
+$("#pick").addEventListener("click", ouvrirDialogue);
+$("#pick").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); ouvrirDialogue(); }
+});
+
+async function ouvrirDialogue() {
+  if (!api) return;
+  const r = await api.choisir_fichier();
+  if (!r) return;
+  if (r.erreur) { $("#erreur-choix").innerHTML = alerte(r.erreur); return; }
+  retenir(r);
+}
+
+function retenir(f) {
+  choisi = f;
+  $("#erreur-choix").innerHTML = "";
+  const pick = $("#pick");
+  pick.classList.add("filled");
+  pick.innerHTML = `<strong>Prêt</strong>
+    <span class="filename">${echapper(f.nom)} · ${f.taille} Mo</span>`;
+  $("#go").disabled = false;
+  if (!$("#matiere").value) {
+    const devine = f.nom.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ")
+                        .replace(/\d/g, "").trim();
+    if (devine.length > 2) $("#matiere").value = devine.slice(0, 60);
+  }
+}
+
+/* ---------- lancement ---------- */
+$("#go").addEventListener("click", async () => {
+  if (!choisi || !api) return;
+  $("#go").disabled = true;
+  const r = await api.lancer({
+    chemin: choisi.chemin,
+    matiere: $("#matiere").value,
+    termes: $("#termes").value,
+    modele: $("#modele").value,
+  });
+  if (r.erreur) { $("#erreur-choix").innerHTML = alerte(r.erreur); $("#go").disabled = false; return; }
+  $("#panel-choix").hidden = true;
+  $("#panel-etapes").hidden = false;
+  window.majEtat(r);
+});
+
+/* ---------- appelée par Python à chaque avancement ---------- */
+window.majEtat = function (t) {
+  for (const [nom, e] of Object.entries(t.etapes)) {
+    const li = document.querySelector(`li[data-etape="${nom}"]`);
+    if (!li) continue;
+    li.dataset.statut = e.statut;
+    const fill = e.statut === "fait" ? 1
+               : e.statut === "ignore" ? 0
+               : e.avancement || (e.statut === "en_cours" ? 0.06 : 0);
+    li.querySelector(".swipe").style.setProperty("--fill", fill.toFixed(3));
+    li.querySelector(".step-detail").textContent = e.detail ||
+      ({en_cours:"en cours", ignore:"ignorée", attente:""}[e.statut] || "");
+  }
+  if (t.etat === "erreur") $("#erreur-etapes").innerHTML = alerte(t.erreur || "Étape interrompue.");
+  if (t.etat === "fini") terminer(t);
+};
+
+/* ---------- résultat ---------- */
+let fini = false;
+async function terminer(t) {
+  if (fini) return;
+  fini = true;
+  $("#panel-resultat").hidden = false;
+  cache.md = await api.lire("md");
+  cache.txt = await api.lire("txt");
+  afficher("md");
+  $("#ouvrir-pdf").disabled = !t.fichiers.pdf;
+  if (!t.fichiers.pdf) $("#ouvrir-pdf").textContent = "PDF non produit";
+
+  const u = t.usage || {};
+  if (u.entree) {
+    const sec = u.duree ? ` en ${Math.round(u.duree / 1000)} s` : "";
+    $("#usage").textContent =
+      `Synthèse : ${u.entree.toLocaleString("fr-FR")} tokens lus, ` +
+      `${(u.sortie || 0).toLocaleString("fr-FR")} écrits${sec}.`;
+  }
+  $("#panel-resultat").scrollIntoView({behavior:"smooth", block:"start"});
+}
+
+document.querySelectorAll(".tab").forEach(t =>
+  t.addEventListener("click", () => afficher(t.dataset.vue)));
+
+function afficher(vue) {
+  document.querySelectorAll(".tab").forEach(t =>
+    t.setAttribute("aria-selected", String(t.dataset.vue === vue)));
+  const v = $("#viewer");
+  v.innerHTML = vue === "md"
+    ? rendre(cache.md || "_Aucune fiche produite._")
+    : `<pre>${echapper(cache.txt || "")}</pre>`;
+  v.parentElement.scrollTop = 0;
+}
+
+$("#ouvrir-pdf").addEventListener("click", () => api.ouvrir("pdf"));
+$("#ouvrir-dossier").addEventListener("click", () => api.ouvrir("dossier"));
+$("#encore").addEventListener("click", () => location.reload());
+$("#copier").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(cache.md || ""); } catch (_) {}
+  $("#copier").textContent = "Copié";
+  setTimeout(() => ($("#copier").textContent = "Copier le Markdown"), 1600);
+});
+
+/* ---------- utilitaires ---------- */
+function echapper(s) {
+  return String(s).replace(/[&<>"]/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+function alerte(m) { return `<div class="alert">${echapper(m)}</div>`; }
+
+/* Rendu Markdown minimal, suffisant pour la structure du CLAUDE.md. */
+function rendre(src) {
+  const blocs = [];
+  src = src.replace(/```(\w*)\n([\s\S]*?)```/g, (_, l, code) => {
+    blocs.push(`<pre><code>${echapper(code.replace(/\n$/, ""))}</code></pre>`);
+    return `\u0000${blocs.length - 1}\u0000`;
+  });
+
+  const inline = (t) => echapper(t)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|\W)\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/&lt;details&gt;&lt;summary&gt;(.*?)&lt;\/summary&gt;([\s\S]*?)&lt;\/details&gt;/g,
+             "<details><summary>$1</summary>$2</details>");
+
+  const out = [], lignes = src.split("\n");
+  let liste = null, table = null;
+  const fermerListe = () => { if (liste) { out.push(`</${liste}>`); liste = null; } };
+  const fermerTable = () => { if (table) { out.push("<table>" + table.join("") + "</table>"); table = null; } };
+
+  for (const brut of lignes) {
+    const ligne = brut.trimEnd();
+    const ph = ligne.match(/^\u0000(\d+)\u0000$/);
+    if (ph) { fermerListe(); fermerTable(); out.push(blocs[+ph[1]]); continue; }
+
+    if (/^\s*\|.*\|\s*$/.test(ligne)) {
+      const cells = ligne.trim().slice(1, -1).split("|").map(c => c.trim());
+      if (cells.every(c => /^:?-{2,}:?$/.test(c))) continue;
+      fermerListe();
+      const tag = table ? "td" : "th";
+      table = table || [];
+      table.push("<tr>" + cells.map(c => `<${tag}>${inline(c)}</${tag}>`).join("") + "</tr>");
+      continue;
+    }
+    fermerTable();
+
+    if (!ligne.trim()) { fermerListe(); continue; }
+    if (/^---+$/.test(ligne.trim())) { fermerListe(); out.push("<hr>"); continue; }
+
+    const h = ligne.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { fermerListe(); out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); continue; }
+
+    if (/^>\s?/.test(ligne)) {
+      fermerListe();
+      out.push(`<blockquote>${inline(ligne.replace(/^>\s?/, ""))}</blockquote>`);
+      continue;
+    }
+
+    const ul = ligne.match(/^\s*[-*]\s+(.*)$/), ol = ligne.match(/^\s*\d+\.\s+(.*)$/);
+    if (ul || ol) {
+      const veut = ul ? "ul" : "ol";
+      if (liste !== veut) { fermerListe(); out.push(`<${veut}>`); liste = veut; }
+      out.push(`<li>${inline((ul || ol)[1])}</li>`);
+      continue;
+    }
+
+    fermerListe();
+    out.push(`<p>${inline(ligne)}</p>`);
+  }
+  fermerListe(); fermerTable();
+  return out.join("\n");
+}
+</script>
+</body>
+</html>
