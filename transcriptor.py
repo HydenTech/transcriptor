@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
+import unicodedata
 from pathlib import Path
 from typing import Any, Optional
 
@@ -28,6 +31,7 @@ for _flux in ("stdout", "stderr"):
 APP_DIR = Path(__file__).resolve().parent
 CLAUDE_MD = APP_DIR / "CLAUDE.md"
 PDF_SCRIPT = APP_DIR / "scripts" / "generate_pdf.py"
+ICONE = APP_DIR / "static" / "transcriptor.ico"
 
 DOCUMENTS = Path(os.environ.get("USERPROFILE", Path.home())) / "Documents"
 SORTIE = Path(os.environ.get("TRANSCRIPTOR_SORTIE", DOCUMENTS / "Transcriptor"))
@@ -41,6 +45,145 @@ STEPS = ("transcription", "synthese", "pdf")
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
 
 _model_cache: dict[str, Any] = {}
+
+
+# ----------------------------------------------------------------------
+# Cycle de vie du processus
+# ----------------------------------------------------------------------
+BASE_LOCALE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Transcriptor"
+JOURNAL = BASE_LOCALE / "journal.log"
+
+_enfants: list[subprocess.Popen] = []
+_verrou_enfants = threading.Lock()
+
+
+def noter(message: str) -> None:
+    """Trace horodatée : sous pythonw.exe, c'est le seul témoin qu'on ait."""
+    try:
+        JOURNAL.parent.mkdir(parents=True, exist_ok=True)
+        if JOURNAL.exists() and JOURNAL.stat().st_size > 512_000:
+            JOURNAL.replace(JOURNAL.with_suffix(".log.1"))
+        with JOURNAL.open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{os.getpid()}] {message}\n")
+    except Exception:
+        pass
+
+
+def suivre(proc: subprocess.Popen) -> subprocess.Popen:
+    """Enregistre un sous-processus pour pouvoir le tuer à la fermeture."""
+    with _verrou_enfants:
+        _enfants.append(proc)
+    return proc
+
+
+def tuer_enfants() -> None:
+    with _verrou_enfants:
+        enfants, _enfants[:] = list(_enfants), []
+    for proc in enfants:
+        if proc.poll() is not None:
+            continue
+        noter(f"arrêt du sous-processus {proc.pid}")
+        try:
+            if os.name == "nt":
+                # claude.cmd lance node, playwright lance chromium :
+                # sans /T les petits-enfants survivent au parent.
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                               capture_output=True, timeout=15,
+                               creationflags=NO_WINDOW)
+            else:
+                proc.kill()
+        except Exception as exc:  # noqa: BLE001
+            noter(f"échec de l'arrêt de {proc.pid} : {exc}")
+
+
+def arreter(code: int = 0) -> None:
+    """Sortie franche. Les threads WinForms de pywebview ne sont pas des
+    threads démons : sans cela le processus survit à sa propre fenêtre."""
+    noter("fermeture demandée")
+    tuer_enfants()
+    noter("processus terminé")
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(code)
+
+
+def identifier_application() -> None:
+    """Sans identite propre, Windows range la fenetre sous pythonw.exe :
+    icone generique dans la barre des taches et epinglage impossible."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Hyden.Transcriptor")
+    except Exception as exc:  # noqa: BLE001
+        noter(f"identité d'application non posée : {exc}")
+
+
+def poser_icone(titre: str = "Transcriptor", patience: float = 15.0) -> None:
+    """pywebview ne pose pas d'icone sur Windows. On attend que la fenetre
+    existe, puis on la lui envoie directement."""
+    if os.name != "nt" or not ICONE.exists():
+        return
+    import ctypes
+
+    u32 = ctypes.windll.user32
+    u32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    u32.FindWindowW.restype = ctypes.c_void_p
+    u32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+                               ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    u32.LoadImageW.restype = ctypes.c_void_p
+    u32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                 ctypes.c_void_p, ctypes.c_void_p]
+    u32.SendMessageW.restype = ctypes.c_void_p
+
+    IMAGE_ICON, LR_LOADFROMFILE = 1, 0x0010
+    WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
+
+    limite = time.time() + patience
+    hwnd = None
+    while time.time() < limite:
+        hwnd = u32.FindWindowW(None, titre)
+        if hwnd:
+            break
+        time.sleep(0.15)
+    if not hwnd:
+        noter("fenêtre introuvable, icône non posée")
+        return
+
+    for taille, lequel in ((16, ICON_SMALL), (32, ICON_BIG)):
+        h = u32.LoadImageW(None, str(ICONE), IMAGE_ICON, taille, taille,
+                           LR_LOADFROMFILE)
+        if h:
+            u32.SendMessageW(hwnd, WM_SETICON, ctypes.c_void_p(lequel),
+                             ctypes.c_void_p(h))
+    noter("icône posée")
+
+
+def preparer_webview2() -> None:
+    """Un profil WebView2 neuf à chaque lancement. Un processus fantôme ne
+    peut donc plus verrouiller le profil de la session suivante — c'est ce
+    verrou qui faisait s'ouvrir puis se figer la deuxième fenêtre."""
+    if os.name != "nt":
+        return
+    base = BASE_LOCALE / "webview2"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        for vieux in base.glob("session-*"):
+            if time.time() - vieux.stat().st_mtime > 6 * 3600:
+                shutil.rmtree(vieux, ignore_errors=True)
+    except Exception:
+        pass
+    try:
+        profil = Path(tempfile.mkdtemp(prefix=f"session-{os.getpid()}-", dir=base))
+        os.environ["WEBVIEW2_USER_DATA_FOLDER"] = str(profil)
+        noter(f"profil WebView2 : {profil}")
+    except Exception as exc:  # noqa: BLE001
+        noter(f"profil WebView2 par défaut ({exc})")
 
 
 # ----------------------------------------------------------------------
@@ -246,6 +389,89 @@ CONSIGNE = (
     "commentaire, en commençant directement par la section 1."
 )
 
+# Sections de sortie attendues. Elles ne sont pas figées ici : elles sont
+# relues dans CLAUDE.md à chaque lancement, pour que modifier CLAUDE.md
+# suffise à changer la sortie sans toucher au code.
+SECTIONS_DEFAUT = {
+    1: "En-tête", 2: "Résumé exécutif", 3: "Plan du cours",
+    4: "Points clés", 5: "Fiches de révision", 6: "Signaux examen",
+    7: "Informations pratiques", 8: "Lexique", 9: "Auto-évaluation",
+    10: "Zones d'ombre",
+}
+
+_RE_TITRE = re.compile(r"^#{1,4}[ \t]*(.+?)[ \t]*$", re.M)
+_RE_NUMERO = re.compile(r"^(\d{1,2})[.)]")
+_RE_SECTION_CONSIGNE = re.compile(r"^#{2,4}[ \t]*(\d{1,2})[.)][ \t]*(.+?)[ \t]*$", re.M)
+
+
+def _sans_accent(texte: str) -> str:
+    plat = unicodedata.normalize("NFD", texte.lower())
+    return "".join(c for c in plat if unicodedata.category(c) != "Mn")
+
+
+class Jalons:
+    """Les titres de sections de CLAUDE.md, servant de repères d'avancement
+    pendant que Claude rédige."""
+
+    def __init__(self, sections: dict[int, str]):
+        self.noms = sections or dict(SECTIONS_DEFAUT)
+        self.total = max(self.noms)
+        self._plats = {n: _sans_accent(v) for n, v in self.noms.items()}
+
+    @classmethod
+    def depuis(cls, *candidats: Path) -> "Jalons":
+        for chemin in candidats:
+            try:
+                texte = chemin.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            trouve: dict[int, str] = {}
+            for m in _RE_SECTION_CONSIGNE.finditer(texte):
+                n = int(m.group(1))
+                if 1 <= n <= 40:
+                    trouve.setdefault(n, m.group(2))
+            if len(trouve) >= 3:
+                return cls(trouve)
+        return cls(dict(SECTIONS_DEFAUT))
+
+    def reperer(self, texte: str) -> int:
+        """Numéro de la section la plus avancée présente dans un fragment."""
+        vu = 0
+        for titre in _RE_TITRE.findall(texte):
+            m = _RE_NUMERO.match(titre)
+            if m and 1 <= int(m.group(1)) <= self.total:
+                vu = max(vu, int(m.group(1)))
+                continue
+            plat = _sans_accent(titre)
+            for n, nom in self._plats.items():
+                if nom and nom in plat:
+                    vu = max(vu, n)
+        return vu
+
+    def etiquette(self, n: int) -> str:
+        return f"Section {n}/{self.total} · {self.noms.get(n, '')}".rstrip(" ·")
+
+
+def _fragment(ev: dict) -> str:
+    """Texte écrit par Claude dans un événement du flux JSON."""
+    genre = ev.get("type")
+    if genre == "stream_event":
+        e = ev.get("event") or {}
+        if e.get("type") == "content_block_delta":
+            d = e.get("delta") or {}
+            if d.get("type") == "text_delta":
+                return d.get("text") or ""
+        return ""
+    if genre == "assistant":
+        blocs = (ev.get("message") or {}).get("content") or []
+        return "".join(b.get("text") or "" for b in blocs
+                       if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+class _OptionInconnue(RuntimeError):
+    """La version de Claude Code installée ne connaît pas ce drapeau."""
+
 
 def chemin_claude() -> Optional[str]:
     trouve = shutil.which("claude") or shutil.which("claude.cmd")
@@ -261,6 +487,84 @@ def chemin_claude() -> Optional[str]:
     return None
 
 
+def _appeler_claude(t: Traitement, commande: list[str], transcription: Path,
+                    jalons: Jalons) -> tuple[str, dict[str, Any]]:
+    debut = time.time()
+    with transcription.open("rb") as stdin:
+        proc = suivre(subprocess.Popen(
+            commande, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=t.dossier, creationflags=NO_WINDOW, shell=False,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        ))
+
+    minuterie = threading.Timer(1800, proc.kill)
+    minuterie.daemon = True
+    minuterie.start()
+
+    lignes: list[str] = []
+    resultat: Optional[dict[str, Any]] = None
+    partiel = ""
+    section = 0
+
+    try:
+        for ligne in proc.stdout:  # type: ignore[union-attr]
+            ligne = ligne.strip()
+            if not ligne:
+                continue
+            lignes.append(ligne)
+            try:
+                ev = json.loads(ligne)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            if ev.get("type") == "result":
+                resultat = ev
+
+            morceau = _fragment(ev)
+            if not morceau:
+                continue
+            partiel += morceau
+            if "\n" in partiel:
+                complet, _, partiel = partiel.rpartition("\n")
+                section = max(section, jalons.reperer(complet))
+            ecoule = int(time.time() - debut)
+            t.maj("synthese",
+                  avancement=section / jalons.total,
+                  detail=(jalons.etiquette(section) if section
+                          else f"Rédaction… {ecoule} s"))
+    finally:
+        minuterie.cancel()
+        erreurs = proc.stderr.read() if proc.stderr else ""  # type: ignore[union-attr]
+        proc.wait()
+
+    if proc.returncode != 0:
+        message = (erreurs or "\n".join(lignes)).strip()
+        if re.search(r"unknown (option|argument)|unrecognized|--\w[\w-]* is not",
+                     message, re.I):
+            raise _OptionInconnue(message)
+        if "login" in message.lower() or "auth" in message.lower():
+            message = ("Claude Code n'est pas connecté. Ouvre une invite de commandes, "
+                       "tape 'claude' et suis la procédure de connexion.")
+        raise RuntimeError(message[:400] or "Claude Code s'est arrêté sans message.")
+
+    if resultat is None:  # sortie JSON d'un seul bloc, non streamée
+        try:
+            charge = json.loads("\n".join(lignes))
+            resultat = charge if isinstance(charge, dict) else None
+        except json.JSONDecodeError:
+            resultat = None
+
+    if resultat is None:
+        return "\n".join(lignes), {}
+
+    markdown = resultat.get("result") or ""
+    u = resultat.get("usage") or {}
+    usage = {"entree": u.get("input_tokens"), "sortie": u.get("output_tokens"),
+             "duree": resultat.get("duration_ms")}
+    return markdown, usage
+
+
 def synthetiser(t: Traitement, transcription: Path) -> Path:
     claude = chemin_claude()
     if not claude:
@@ -270,38 +574,40 @@ def synthetiser(t: Traitement, transcription: Path) -> Path:
 
     t.maj("synthese", statut="en_cours", detail="Claude lit la transcription")
 
-    with transcription.open("rb") as stdin:
-        proc = subprocess.run(
-            [claude, "-p", CONSIGNE, "--output-format", "json", "--max-turns", "6"],
-            stdin=stdin, capture_output=True, cwd=t.dossier,
-            timeout=1800, creationflags=NO_WINDOW, shell=False,
-        )
+    # La copie posée dans le dossier du cours fait foi ; le fichier de
+    # l'application sert de secours.
+    jalons = Jalons.depuis(t.dossier / "CLAUDE.md", CLAUDE_MD)
 
-    if proc.returncode != 0:
-        message = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
-        if "login" in message.lower() or "auth" in message.lower():
-            message = ("Claude Code n'est pas connecté. Ouvre une invite de commandes, "
-                       "tape 'claude' et suis la procédure de connexion.")
-        raise RuntimeError(message[:400] or "Claude Code s'est arrêté sans message.")
+    base = [claude, "-p", CONSIGNE, "--max-turns", "6"]
+    # Du plus bavard au plus sobre : chaque repli perd un peu d'avancement
+    # mais reste fonctionnel sur une version plus ancienne du CLI.
+    tentatives = [
+        base + ["--output-format", "stream-json", "--verbose",
+                "--include-partial-messages"],
+        base + ["--output-format", "stream-json", "--verbose"],
+        base + ["--output-format", "json"],
+    ]
 
-    brut = proc.stdout.decode("utf-8", "replace").strip()
-    markdown = brut
-    try:
-        charge = json.loads(brut)
-        markdown = charge.get("result", brut)
-        u = charge.get("usage") or {}
-        t.usage = {"entree": u.get("input_tokens"), "sortie": u.get("output_tokens"),
-                   "duree": charge.get("duration_ms")}
-    except json.JSONDecodeError:
-        pass
+    derniere: Optional[Exception] = None
+    for commande in tentatives:
+        try:
+            markdown, usage = _appeler_claude(t, commande, transcription, jalons)
+            break
+        except _OptionInconnue as exc:
+            derniere = exc
+    else:
+        raise RuntimeError(str(derniere)[:400] if derniere else
+                           "Claude Code n'a accepté aucun format de sortie.")
 
     if not markdown.strip():
         raise RuntimeError("Claude a renvoyé une réponse vide.")
 
+    t.usage = usage
     sortie = t.dossier / f"{t.audio.stem}.md"
     sortie.write_text(markdown.strip() + "\n", encoding="utf-8")
     t.fichiers["md"] = str(sortie)
-    t.maj("synthese", statut="fait", avancement=1.0, detail=f"{len(markdown.split())} mots")
+    t.maj("synthese", statut="fait", avancement=1.0,
+          detail=f"{len(markdown.split())} mots")
     return sortie
 
 
@@ -314,13 +620,18 @@ def mettre_en_page(t: Traitement, markdown: Path) -> None:
         return
 
     t.maj("pdf", statut="en_cours", detail="Rendu en cours")
-    proc = subprocess.run(
+    proc = suivre(subprocess.Popen(
         [sys.executable, str(PDF_SCRIPT), str(markdown)],
-        capture_output=True, timeout=600, creationflags=NO_WINDOW,
-    )
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NO_WINDOW,
+    ))
+    try:
+        _, err = proc.communicate(timeout=600)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        _, err = proc.communicate()
     pdf = markdown.with_suffix(".pdf")
     if proc.returncode != 0 or not pdf.exists():
-        lignes = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        lignes = (err or b"").decode("utf-8", "replace").strip().splitlines()
         t.maj("pdf", statut="ignore",
               detail=lignes[-1][:150] if lignes else "Chromium indisponible")
         return
@@ -450,32 +761,47 @@ def _lisible(exc: Exception) -> str:
 
 
 def main() -> None:
+    noter("démarrage")
+    identifier_application()
     enregistrer_dll_cuda()
     SORTIE.mkdir(parents=True, exist_ok=True)
+    preparer_webview2()
 
     import webview
 
+    noter(f"pywebview {getattr(webview, '__version__', '?')}")
     passerelle = Passerelle()
-    passerelle.fenetre = webview.create_window(
+    fenetre = webview.create_window(
         "Transcriptor",
         str(APP_DIR / "static" / "index.html"),
         js_api=passerelle,
         width=980, height=860, min_size=(560, 620),
         background_color="#EDEFE9",
     )
-    webview.start()
+    passerelle.fenetre = fenetre
 
-    # WebView2 verrouille son dossier de donnees. Un processus fantome laisse
-    # apres la fermeture empeche le lancement suivant : la fenetre s'ouvre
-    # puis se fige. On coupe net plutot que d'attendre les threads restants.
-    sys.stdout.flush()
-    os._exit(0)
+    # Filet de sécurité : si webview.start() ne rend jamais la main — ça
+    # arrive — la fermeture de la fenêtre coupe quand même le processus.
+    try:
+        fenetre.events.closed += lambda: arreter(0)
+    except Exception as exc:  # noqa: BLE001
+        noter(f"événement closed indisponible : {exc}")
+
+    # La fenetre n'existe pas encore : un guetteur la reconnaitra a son titre.
+    threading.Thread(target=poser_icone, daemon=True).start()
+
+    noter("fenêtre créée, ouverture")
+    webview.start()
+    noter("webview.start() a rendu la main")
+
+    arreter(0)
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
+        noter("échec au démarrage :\n" + traceback.format_exc())
         rapport = SORTIE / "erreur.txt"
         rapport.parent.mkdir(parents=True, exist_ok=True)
         rapport.write_text(traceback.format_exc(), encoding="utf-8")

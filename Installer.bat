@@ -77,6 +77,7 @@ powershell -NoProfile -Command ^
   "$s.Arguments='\"%RACINE%transcriptor.py\"';" ^
   "$s.WorkingDirectory='%RACINE%';" ^
   "$s.Description='Transcrire et resumer un cours';" ^
+  "$s.IconLocation='%RACINE%static\transcriptor.ico';" ^
   "$s.Save()" >nul 2>&1
 
 echo.
