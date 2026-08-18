@@ -69,6 +69,27 @@ def noter(message: str) -> None:
         pass
 
 
+def brancher_journal() -> None:
+    """Renvoie les logs des bibliothèques vers le journal. pywebview signale
+    ses erreurs par logging.exception : sous pythonw, sans destinataire,
+    elles disparaissaient purement et simplement."""
+    import logging
+
+    class _VersJournal(logging.Handler):
+        def emit(self, record: "logging.LogRecord") -> None:
+            try:
+                noter(f"[{record.name}] {self.format(record)}")
+            except Exception:
+                pass
+
+    poste = _VersJournal()
+    poste.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    racine = logging.getLogger()
+    racine.addHandler(poste)
+    racine.setLevel(logging.WARNING)
+    logging.getLogger("pywebview").setLevel(logging.DEBUG)
+
+
 def suivre(proc: subprocess.Popen) -> subprocess.Popen:
     """Enregistre un sous-processus pour pouvoir le tuer à la fermeture."""
     with _verrou_enfants:
@@ -108,6 +129,92 @@ def arreter(code: int = 0) -> None:
     except Exception:
         pass
     os._exit(code)
+
+
+# Handle de la fenetre principale, releve une fois qu'elle existe.
+_HANDLE_FENETRE: dict[str, Any] = {}
+
+
+# Masques du filtre de la boîte « Ouvrir ».
+def _filtre_audio() -> list[tuple[str, str]]:
+    return [("Fichiers audio", ";".join(f"*{e}" for e in AUDIO_EXT)),
+            ("Tous les fichiers", "*.*")]
+
+
+def choisir_fichier_natif(titre: str = "Choisir l'enregistrement") -> Optional[str]:
+    """Boîte « Ouvrir » de Windows, affichée sur un thread STA dédié.
+
+    pywebview exécute les appels venus du JavaScript sur un thread Python
+    ordinaire — donc MTA côté .NET — puis y ouvre WinForms.OpenFileDialog en
+    lui passant un formulaire appartenant à un autre thread. Double faute :
+    violation d'apartment COM et accès inter-thread à un contrôle. C'est ce
+    qui fait tomber l'application au clic sur « choisir l'enregistrement ».
+    On ouvre donc la boîte nous-mêmes, sur un thread correctement initialisé.
+
+    Renvoie le chemin choisi, None si annulé, et lève RuntimeError si la
+    boîte n'a pas pu s'ouvrir — l'appelant retombera alors sur pywebview.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class OPENFILENAMEW(ctypes.Structure):
+        _fields_ = [
+            ("lStructSize", wintypes.DWORD), ("hwndOwner", wintypes.HWND),
+            ("hInstance", wintypes.HINSTANCE), ("lpstrFilter", wintypes.LPCWSTR),
+            ("lpstrCustomFilter", wintypes.LPWSTR), ("nMaxCustFilter", wintypes.DWORD),
+            ("nFilterIndex", wintypes.DWORD), ("lpstrFile", wintypes.LPWSTR),
+            ("nMaxFile", wintypes.DWORD), ("lpstrFileTitle", wintypes.LPWSTR),
+            ("nMaxFileTitle", wintypes.DWORD), ("lpstrInitialDir", wintypes.LPCWSTR),
+            ("lpstrTitle", wintypes.LPCWSTR), ("Flags", wintypes.DWORD),
+            ("nFileOffset", wintypes.WORD), ("nFileExtension", wintypes.WORD),
+            ("lpstrDefExt", wintypes.LPCWSTR), ("lCustData", wintypes.LPARAM),
+            ("lpfnHook", wintypes.LPVOID), ("lpTemplateName", wintypes.LPCWSTR),
+            ("pvReserved", wintypes.LPVOID), ("dwReserved", wintypes.DWORD),
+            ("FlagsEx", wintypes.DWORD),
+        ]
+
+    filtre = "".join(f"{nom}\0{masque}\0" for nom, masque in _filtre_audio()) + "\0"
+    tampon = ctypes.create_unicode_buffer(8192)
+    issue: dict[str, Any] = {}
+
+    OFN = 0x0008_180C  # EXPLORER | FILEMUSTEXIST | PATHMUSTEXIST | NOCHANGEDIR | HIDEREADONLY
+    COINIT_APARTMENTTHREADED = 0x2
+
+    def _montrer() -> None:
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+        try:
+            ofn = OPENFILENAMEW()
+            ofn.lStructSize = ctypes.sizeof(ofn)
+            # Sans propriétaire, la boîte peut s'ouvrir derrière la fenêtre :
+            # l'utilisateur clique et croit que rien ne se passe.
+            proprietaire = _HANDLE_FENETRE.get("hwnd")
+            if proprietaire:
+                ofn.hwndOwner = proprietaire
+            ofn.lpstrFilter = filtre
+            ofn.lpstrFile = ctypes.cast(tampon, wintypes.LPWSTR)
+            ofn.nMaxFile = len(tampon)
+            ofn.lpstrTitle = titre
+            ofn.Flags = OFN
+            if ctypes.windll.comdlg32.GetOpenFileNameW(ctypes.byref(ofn)):
+                issue["chemin"] = tampon.value
+            else:
+                code = ctypes.windll.comdlg32.CommDlgExtendedError()
+                if code:                       # 0 = simple annulation
+                    issue["erreur"] = f"CommDlgExtendedError 0x{code:04X}"
+        except Exception as exc:  # noqa: BLE001
+            issue["erreur"] = str(exc)
+        finally:
+            ole32.CoUninitialize()
+
+    fil = threading.Thread(target=_montrer, daemon=True)
+    fil.start()
+    fil.join(600)
+    if fil.is_alive():
+        raise RuntimeError("la boîte de dialogue ne répond pas")
+    if "erreur" in issue:
+        raise RuntimeError(issue["erreur"])
+    return issue.get("chemin")
 
 
 def identifier_application() -> None:
@@ -154,6 +261,7 @@ def poser_icone(titre: str = "Transcriptor", patience: float = 15.0) -> None:
     if not hwnd:
         noter("fenêtre introuvable, icône non posée")
         return
+    _HANDLE_FENETRE["hwnd"] = hwnd
 
     for taille, lequel in ((16, ICON_SMALL), (32, ICON_BIG)):
         h = u32.LoadImageW(None, str(ICONE), IMAGE_ICON, taille, taille,
@@ -644,17 +752,37 @@ def mettre_en_page(t: Traitement, markdown: Path) -> None:
 # Passerelle exposée à l'interface
 # ----------------------------------------------------------------------
 class Passerelle:
+    """Objet exposé au JavaScript.
+
+    Attention : pywebview parcourt récursivement les attributs publics de cet
+    objet pour construire l'API JavaScript (util.py, get_functions). Un
+    attribut public tenant la fenêtre l'entraînait jusque dans les propriétés
+    COM de CoreWebView2, qu'il interrogeait depuis un thread autre que celui
+    de l'interface — ce que WebView2 interdit formellement. D'où les
+    plantages au démarrage. Tout ce qui n'est pas une méthode destinée au
+    JavaScript doit donc commencer par un souligné : le parcours l'ignore.
+    """
+
     def __init__(self):
-        self.fenetre = None
-        self.courant: Optional[Traitement] = None
+        self._fenetre = None
+        self._courant: Optional[Traitement] = None
 
     # -- appelée depuis le JavaScript ---------------------------------
     def choisir_fichier(self) -> Optional[dict[str, Any]]:
+        noter("appel choisir_fichier")
+        if os.name == "nt":
+            try:
+                chemin = choisir_fichier_natif()
+                noter(f"boîte native : {chemin or 'annulée'}")
+                return self._decrire(chemin) if chemin else None
+            except Exception as exc:  # noqa: BLE001
+                noter(f"boîte native indisponible ({exc}), repli sur pywebview")
+
         import webview
 
         motifs = ("Fichiers audio (" + ";".join(f"*{e}" for e in AUDIO_EXT) + ")",
                   "Tous les fichiers (*.*)")
-        resultat = self.fenetre.create_file_dialog(
+        resultat = self._fenetre.create_file_dialog(
             webview.OPEN_DIALOG, allow_multiple=False, file_types=motifs)
         if not resultat:
             return None
@@ -662,6 +790,7 @@ class Passerelle:
 
     def fichier_initial(self) -> Optional[dict[str, Any]]:
         """Audio déposé sur le raccourci du bureau ou passé en argument."""
+        noter(f"appel fichier_initial : {sys.argv[1:]!r}")
         if len(sys.argv) > 1:
             return self._decrire(sys.argv[1])
         return None
@@ -679,6 +808,8 @@ class Passerelle:
                 "taille": round(p.stat().st_size / 1048576)}
 
     def lancer(self, options: dict[str, Any]) -> dict[str, Any]:
+        noter(f"appel lancer : {options.get('chemin')!r}, "
+              f"modèle {options.get('modele')!r}")
         audio = Path(options.get("chemin", ""))
         if not audio.exists():
             return {"erreur": "Fichier introuvable."}
@@ -692,22 +823,22 @@ class Passerelle:
         if CLAUDE_MD.exists():
             shutil.copy(CLAUDE_MD, dossier / "CLAUDE.md")
 
-        self.courant = Traitement(audio, dossier, options, self._pousser)
-        threading.Thread(target=self._pipeline, args=(self.courant,), daemon=True).start()
-        return self.courant.instantane()
+        self._courant = Traitement(audio, dossier, options, self._pousser)
+        threading.Thread(target=self._pipeline, args=(self._courant,), daemon=True).start()
+        return self._courant.instantane()
 
     def lire(self, genre: str) -> str:
-        if not self.courant:
+        if not self._courant:
             return ""
-        chemin = self.courant.fichiers.get(genre)
+        chemin = self._courant.fichiers.get(genre)
         if not chemin or not Path(chemin).exists():
             return ""
         return Path(chemin).read_text(encoding="utf-8")
 
     def ouvrir(self, cible: str) -> None:
-        if not self.courant:
+        if not self._courant:
             return
-        chemin = self.courant.fichiers.get(cible) or str(self.courant.dossier)
+        chemin = self._courant.fichiers.get(cible) or str(self._courant.dossier)
         try:
             os.startfile(chemin)  # noqa: S606
         except Exception:
@@ -715,15 +846,16 @@ class Passerelle:
 
     # -- interne -------------------------------------------------------
     def _pousser(self, instantane: dict[str, Any]) -> None:
-        if not self.fenetre:
+        if not self._fenetre:
             return
         charge = json.dumps(instantane, ensure_ascii=False)
         try:
-            self.fenetre.evaluate_js(f"window.majEtat({charge})")
+            self._fenetre.evaluate_js(f"window.majEtat({charge})")
         except Exception:
             pass
 
     def _pipeline(self, t: Traitement) -> None:
+        noter(f"pipeline : {t.audio.name} -> {t.dossier}")
         try:
             transcription = transcrire(t)
         except Exception as exc:  # noqa: BLE001
@@ -762,6 +894,7 @@ def _lisible(exc: Exception) -> str:
 
 def main() -> None:
     noter("démarrage")
+    brancher_journal()
     identifier_application()
     enregistrer_dll_cuda()
     SORTIE.mkdir(parents=True, exist_ok=True)
@@ -778,14 +911,22 @@ def main() -> None:
         width=980, height=860, min_size=(560, 620),
         background_color="#EDEFE9",
     )
-    passerelle.fenetre = fenetre
+    passerelle._fenetre = fenetre
 
     # Filet de sécurité : si webview.start() ne rend jamais la main — ça
     # arrive — la fermeture de la fenêtre coupe quand même le processus.
-    try:
-        fenetre.events.closed += lambda: arreter(0)
-    except Exception as exc:  # noqa: BLE001
-        noter(f"événement closed indisponible : {exc}")
+    def _tracer(nom: str):
+        def _reagir(*_a: Any, **_k: Any) -> None:
+            noter(f"événement {nom}")
+            if nom == "closed":
+                arreter(0)
+        return _reagir
+
+    for nom in ("shown", "loaded", "closing", "closed"):
+        try:
+            getattr(fenetre.events, nom).__iadd__(_tracer(nom))
+        except Exception as exc:  # noqa: BLE001
+            noter(f"événement {nom} indisponible : {exc}")
 
     # La fenetre n'existe pas encore : un guetteur la reconnaitra a son titre.
     threading.Thread(target=poser_icone, daemon=True).start()

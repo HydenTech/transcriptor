@@ -224,9 +224,20 @@ let api = null, choisi = null, cache = {md:"", txt:""};
 
 window.addEventListener("pywebviewready", async () => {
   api = window.pywebview.api;
-  const initial = await api.fichier_initial();
-  if (initial && initial.chemin) retenir(initial);
+  try {
+    const initial = await api.fichier_initial();
+    if (initial && initial.chemin) retenir(initial);
+  } catch (e) {
+    $("#erreur-choix").innerHTML = alerte("Fichier initial illisible : " + e);
+  }
 });
+
+/* Rien ne doit échouer en silence : sans destinataire, une erreur du pont
+   Python laisse simplement un bouton inerte. */
+window.addEventListener("unhandledrejection", (e) =>
+  ($("#erreur-choix").innerHTML = alerte("Erreur interne : " + (e.reason || ""))));
+window.addEventListener("error", (e) =>
+  ($("#erreur-choix").innerHTML = alerte("Erreur interne : " + (e.message || ""))));
 
 /* ---------- choix du fichier ---------- */
 $("#pick").addEventListener("click", ouvrirDialogue);
@@ -236,10 +247,14 @@ $("#pick").addEventListener("keydown", (e) => {
 
 async function ouvrirDialogue() {
   if (!api) return;
-  const r = await api.choisir_fichier();
-  if (!r) return;
-  if (r.erreur) { $("#erreur-choix").innerHTML = alerte(r.erreur); return; }
-  retenir(r);
+  try {
+    const r = await api.choisir_fichier();
+    if (!r) return;
+    if (r.erreur) { $("#erreur-choix").innerHTML = alerte(r.erreur); return; }
+    retenir(r);
+  } catch (e) {
+    $("#erreur-choix").innerHTML = alerte("Ouverture du sélecteur impossible : " + e);
+  }
 }
 
 function retenir(f) {
@@ -261,6 +276,7 @@ function retenir(f) {
 $("#go").addEventListener("click", async () => {
   if (!choisi || !api) return;
   $("#go").disabled = true;
+  try {
   const r = await api.lancer({
     chemin: choisi.chemin,
     matiere: $("#matiere").value,
@@ -271,6 +287,10 @@ $("#go").addEventListener("click", async () => {
   $("#panel-choix").hidden = true;
   $("#panel-etapes").hidden = false;
   window.majEtat(r);
+  } catch (e) {
+    $("#erreur-choix").innerHTML = alerte("Lancement impossible : " + e);
+    $("#go").disabled = false;
+  }
 });
 
 /* ---------- appelée par Python à chaque avancement ---------- */
