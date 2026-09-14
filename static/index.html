@@ -53,6 +53,7 @@ h1{font-family:var(--display);font-weight:600;font-size:40px;line-height:1.06;
 .pick strong{font-family:var(--display);font-weight:600;font-size:18px;
   display:block;margin-bottom:4px}
 .pick span{color:var(--ink-2);font-size:13.5px}
+.pick code{font-family:var(--mono);font-size:12.5px}
 .pick.filled{text-align:left;padding:18px 20px;border-style:solid;border-color:var(--ink)}
 .filename{font-family:var(--mono);font-size:13px;word-break:break-all}
 
@@ -72,6 +73,17 @@ input:focus,select:focus,textarea:focus{border-color:var(--ink)}
   cursor:pointer;transition:opacity .15s}
 .go:hover{opacity:.88}
 .go:disabled{opacity:.32;cursor:not-allowed}
+
+/* état de Claude Code, vérifié au lancement */
+.outil{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);margin:12px 0 0;
+  display:flex;align-items:center;gap:8px;min-height:16px}
+.outil:empty{display:none}
+.outil::before{content:"";width:7px;height:7px;border-radius:50%;flex:none;background:#B8BFB2}
+.outil[data-etat="maj"]::before{background:var(--hi-yellow);
+  box-shadow:0 0 0 2px #E9F660aa;animation:pulse 1.1s ease-in-out infinite}
+.outil[data-etat="ok"]::before{background:#4BAA5E}
+.outil[data-etat="echec"]::before,.outil[data-etat="absent"]::before{background:var(--red)}
+@keyframes pulse{50%{opacity:.35}}
 
 ol.steps{list-style:none;margin:0;padding:0}
 ol.steps li{display:grid;grid-template-columns:24px 1fr auto;align-items:baseline;
@@ -149,7 +161,8 @@ li[data-statut="erreur"] .step-detail{color:var(--red)}
 
     <div class="pick" id="pick" tabindex="0" role="button">
       <strong>Choisir l'enregistrement</strong>
-      <span>MP3, WAV, M4A, OGG, FLAC ou OPUS — jusqu'à trois heures</span>
+      <span>MP3, WAV, M4A, OGG, FLAC ou OPUS — jusqu'à trois heures.<br>
+        Ou un <code>transcription.txt</code> déjà produit, pour ne refaire que la synthèse.</span>
     </div>
 
     <div class="fields">
@@ -175,6 +188,7 @@ li[data-statut="erreur"] .step-detail{color:var(--red)}
     </div>
 
     <button class="go" id="go" disabled>Transcrire et résumer</button>
+    <p class="outil" id="etat-claude" data-etat="inconnu"></p>
     <div id="erreur-choix"></div>
   </section>
 
@@ -224,6 +238,7 @@ let api = null, choisi = null, cache = {md:"", txt:""};
 
 window.addEventListener("pywebviewready", async () => {
   api = window.pywebview.api;
+  suivreClaude();
   try {
     const initial = await api.fichier_initial();
     if (initial && initial.chemin) retenir(initial);
@@ -231,6 +246,26 @@ window.addEventListener("pywebviewready", async () => {
     $("#erreur-choix").innerHTML = alerte("Fichier initial illisible : " + e);
   }
 });
+
+/* ---------- Claude Code : mise à jour au lancement ---------- */
+/* Python pousse l'état par window.majClaude ; tant que la page n'était pas
+   prête il a pu parler dans le vide, d'où une relance polie jusqu'à ce
+   que la vérification soit terminée. */
+window.majClaude = function (s) {
+  const p = $("#etat-claude");
+  p.dataset.etat = s.etat || "inconnu";
+  p.textContent = s.texte || "";
+};
+async function suivreClaude() {
+  for (let i = 0; i < 200; i++) {            // 200 × 3 s : au-delà, on laisse
+    try {
+      const s = await api.etat_claude();
+      window.majClaude(s);
+      if (s.etat !== "maj" && s.etat !== "inconnu") return;
+    } catch (_) {}
+    await new Promise(r => setTimeout(r, 3000));
+  }
+}
 
 /* Rien ne doit échouer en silence : sans destinataire, une erreur du pont
    Python laisse simplement un bouton inerte. */
@@ -262,14 +297,22 @@ function retenir(f) {
   $("#erreur-choix").innerHTML = "";
   const pick = $("#pick");
   pick.classList.add("filled");
-  pick.innerHTML = `<strong>Prêt</strong>
-    <span class="filename">${echapper(f.nom)} · ${f.taille} Mo</span>`;
-  $("#go").disabled = false;
-  if (!$("#matiere").value) {
-    const devine = f.nom.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ")
-                        .replace(/\d/g, "").trim();
-    if (devine.length > 2) $("#matiere").value = devine.slice(0, 60);
+  if (f.reprise) {
+    pick.innerHTML = `<strong>Reprise — synthèse seule</strong>
+      <span class="filename">${echapper(f.nom)} · ${f.mots.toLocaleString("fr-FR")} mots</span>`;
+    $("#go").textContent = "Résumer la transcription";
+    if (f.matiere && !$("#matiere").value) $("#matiere").value = f.matiere;
+  } else {
+    pick.innerHTML = `<strong>Prêt</strong>
+      <span class="filename">${echapper(f.nom)} · ${f.taille} Mo</span>`;
+    $("#go").textContent = "Transcrire et résumer";
+    if (!$("#matiere").value) {
+      const devine = f.nom.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ")
+                          .replace(/\d/g, "").trim();
+      if (devine.length > 2) $("#matiere").value = devine.slice(0, 60);
+    }
   }
+  $("#go").disabled = false;
 }
 
 /* ---------- lancement ---------- */
@@ -306,9 +349,37 @@ window.majEtat = function (t) {
     li.querySelector(".step-detail").textContent = e.detail ||
       ({en_cours:"en cours", ignore:"ignorée", attente:""}[e.statut] || "");
   }
-  if (t.etat === "erreur") $("#erreur-etapes").innerHTML = alerte(t.erreur || "Étape interrompue.");
+  if (t.etat === "erreur") signalerEchec(t);
   if (t.etat === "fini") terminer(t);
 };
+
+/* ---------- échec : on ne repart pas de zéro ---------- */
+function signalerEchec(t) {
+  const enPanne = Object.entries(t.etapes).find(([, e]) => e.statut === "erreur");
+  const etape = enPanne ? enPanne[0] : "";
+  let html = alerte(t.erreur || "Étape interrompue.") + `<div class="actions">`;
+  if (etape === "synthese") {
+    html += `<button class="action action--fort" id="relancer">Relancer la synthèse</button>`;
+  }
+  html += `<button class="action" id="ouvrir-dossier-echec">Ouvrir le dossier</button>
+           <button class="action" id="recommencer">Un autre cours</button></div>`;
+  $("#erreur-etapes").innerHTML = html;
+
+  const relancer = $("#relancer");
+  if (relancer) relancer.addEventListener("click", async () => {
+    relancer.disabled = true;
+    try {
+      const r = await api.relancer_synthese();
+      if (r.erreur) { $("#erreur-etapes").innerHTML = alerte(r.erreur); return; }
+      $("#erreur-etapes").innerHTML = "";
+      window.majEtat(r);
+    } catch (e) {
+      $("#erreur-etapes").innerHTML = alerte("Relance impossible : " + e);
+    }
+  });
+  $("#ouvrir-dossier-echec").addEventListener("click", () => api.ouvrir("dossier"));
+  $("#recommencer").addEventListener("click", () => location.reload());
+}
 
 /* ---------- résultat ---------- */
 let fini = false;

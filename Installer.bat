@@ -59,6 +59,8 @@ python -m playwright install chromium >nul 2>&1 || (
 )
 
 REM --- 4. Claude Code ------------------------------------------------
+REM Deja installe : on le met a jour (l'app le fait aussi a chaque lancement,
+REM car en mode headless le CLI ne se met jamais a jour tout seul).
 echo   [5/5] Claude Code
 where claude >nul 2>&1
 if errorlevel 1 (
@@ -67,7 +69,10 @@ if errorlevel 1 (
         winget install -e --id OpenJS.NodeJS.LTS --silent --accept-source-agreements --accept-package-agreements
         set "PATH=%ProgramFiles%\nodejs;%APPDATA%\npm;%PATH%"
     )
-    call npm install -g @anthropic-ai/claude-code
+    call npm install -g @anthropic-ai/claude-code@latest
+) else (
+    echo         Mise a jour de Claude Code...
+    call claude update
 )
 
 REM --- 5. Raccourci bureau -------------------------------------------

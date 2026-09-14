@@ -97,24 +97,32 @@ def suivre(proc: subprocess.Popen) -> subprocess.Popen:
     return proc
 
 
+def tuer(proc: subprocess.Popen, motif: str = "") -> None:
+    """Arrête un sous-processus ET sa descendance.
+
+    Un simple proc.kill() ne suffit pas sur Windows : claude.cmd n'est qu'un
+    wrapper, c'est node qui travaille ; playwright lance chromium. Sans /T,
+    les petits-enfants survivent — et continuent d'écrire dans nos tuyaux.
+    """
+    if proc.poll() is not None:
+        return
+    noter(f"arrêt du sous-processus {proc.pid}" + (f" ({motif})" if motif else ""))
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=15,
+                           creationflags=NO_WINDOW)
+        else:
+            proc.kill()
+    except Exception as exc:  # noqa: BLE001
+        noter(f"échec de l'arrêt de {proc.pid} : {exc}")
+
+
 def tuer_enfants() -> None:
     with _verrou_enfants:
         enfants, _enfants[:] = list(_enfants), []
     for proc in enfants:
-        if proc.poll() is not None:
-            continue
-        noter(f"arrêt du sous-processus {proc.pid}")
-        try:
-            if os.name == "nt":
-                # claude.cmd lance node, playwright lance chromium :
-                # sans /T les petits-enfants survivent au parent.
-                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                               capture_output=True, timeout=15,
-                               creationflags=NO_WINDOW)
-            else:
-                proc.kill()
-        except Exception as exc:  # noqa: BLE001
-            noter(f"échec de l'arrêt de {proc.pid} : {exc}")
+        tuer(proc, "fermeture")
 
 
 def arreter(code: int = 0) -> None:
@@ -138,6 +146,7 @@ _HANDLE_FENETRE: dict[str, Any] = {}
 # Masques du filtre de la boîte « Ouvrir ».
 def _filtre_audio() -> list[tuple[str, str]]:
     return [("Fichiers audio", ";".join(f"*{e}" for e in AUDIO_EXT)),
+            ("Transcription déjà produite", "*.txt"),
             ("Tous les fichiers", "*.*")]
 
 
@@ -493,9 +502,17 @@ def _transcrire(t: Traitement, *, cpu: bool) -> Path:
 CONSIGNE = (
     "La transcription brute d'un cours t'est transmise sur l'entrée standard. "
     "Produis le support de révision complet en suivant strictement les instructions "
-    "de CLAUDE.md. Réponds uniquement par le Markdown final, sans préambule ni "
-    "commentaire, en commençant directement par la section 1."
+    "de CLAUDE.md. Traite la transcription en entier, en une seule réponse : "
+    "personne ne pourra te dire de continuer. Réponds uniquement par le Markdown "
+    "final, sans préambule ni commentaire, en commençant directement par la section 1."
 )
+
+# Garde-fous de l'appel à Claude. L'ancien couperet fixe (30 min) tombait en
+# pleine rédaction d'un cours long — et ne tuait que claude.cmd, pas node.
+INACTIVITE_MAX = 20 * 60   # plus aucune ligne reçue depuis ce délai : on coupe
+DUREE_MAX = 120 * 60       # plafond absolu, quoi qu'il arrive
+JOURNAL_SYNTHESE = "synthese.log"      # dans le dossier du cours
+PARTIEL_SYNTHESE = "synthese_partielle.md"
 
 # Sections de sortie attendues. Elles ne sont pas figées ici : elles sont
 # relues dans CLAUDE.md à chaque lancement, pour que modifier CLAUDE.md
@@ -581,6 +598,17 @@ class _OptionInconnue(RuntimeError):
     """La version de Claude Code installée ne connaît pas ce drapeau."""
 
 
+class _CliObsolete(RuntimeError):
+    """Claude Code refuse le modèle : une version plus récente est exigée."""
+
+
+# « API Error: 400 Claude Code 2.1.234 does not support this model; version
+# 2.1.251 or newer is required. Run 'claude update' … »
+_RE_CLI_OBSOLETE = re.compile(
+    r"does not support this model|version [\d.]+ or newer is required|"
+    r"run 'claude update'|please update claude code", re.I)
+
+
 def chemin_claude() -> Optional[str]:
     trouve = shutil.which("claude") or shutil.which("claude.cmd")
     if trouve:
@@ -595,9 +623,166 @@ def chemin_claude() -> Optional[str]:
     return None
 
 
+def _lancer_utilitaire(commande: list[str], delai: int) -> tuple[int, str]:
+    """Exécute une commande silencieuse (pas de fenêtre) et renvoie
+    (code, sortie stdout+stderr)."""
+    try:
+        proc = suivre(subprocess.Popen(
+            commande, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, creationflags=NO_WINDOW,
+            text=True, encoding="utf-8", errors="replace"))
+        try:
+            sortie, _ = proc.communicate(timeout=delai)
+        except subprocess.TimeoutExpired:
+            tuer(proc, "délai dépassé")
+            sortie, _ = proc.communicate()
+            return -1, (sortie or "") + "\n[délai dépassé]"
+        return proc.returncode, sortie or ""
+    except Exception as exc:  # noqa: BLE001
+        return -1, str(exc)
+
+
+def version_claude(claude: str) -> str:
+    code, sortie = _lancer_utilitaire([claude, "--version"], 60)
+    m = re.search(r"\d+\.\d+\.\d+", sortie)
+    return m.group(0) if (code == 0 and m) else ""
+
+
+def mettre_a_jour_claude(claude: str, signaler=None) -> str:
+    """Met Claude Code à jour et renvoie la version obtenue ('' si inconnue).
+
+    Le CLI ne se met à jour tout seul qu'en session interactive ; ici il
+    n'est jamais lancé qu'en headless par l'application, donc il vieillit
+    jusqu'à ce que l'API refuse le modèle. `claude update` couvre les
+    installations natives et npm ; en cas d'échec, npm est tenté directement.
+    """
+    avant = version_claude(claude)
+    noter(f"claude : mise à jour (version actuelle {avant or '?'})")
+    if signaler:
+        signaler(f"Mise à jour de Claude Code ({avant or '?'})…")
+
+    code, sortie = _lancer_utilitaire([claude, "update"], 600)
+    noter(f"claude update : code {code} — {sortie.strip()[-300:]}")
+    apres = version_claude(claude)
+    if apres and apres != avant:
+        noter(f"claude : {avant or '?'} -> {apres}")
+        return apres
+
+    npm = shutil.which("npm") or shutil.which("npm.cmd")
+    if npm:
+        code, sortie = _lancer_utilitaire(
+            [npm, "install", "-g", "@anthropic-ai/claude-code@latest"], 900)
+        noter(f"npm install claude-code : code {code} — {sortie.strip()[-300:]}")
+        apres = version_claude(claude)
+        if apres and apres != avant:
+            noter(f"claude : {avant or '?'} -> {apres} (npm)")
+            return apres
+    return apres if apres != avant else ""
+
+
+_MAJ_CLAUDE_FINIE = threading.Event()
+_MAJ_CLAUDE_FINIE.set()   # levé par défaut : seul main() l'abaisse, le temps de la vérification
+# État affiché dans l'interface : {"etat": "maj" | "ok" | "echec" | "absent", "texte": …}
+_ETAT_CLAUDE: dict[str, str] = {"etat": "inconnu", "texte": ""}
+
+
+def maj_claude_en_arriere_plan(signaler=None) -> None:
+    """Au lancement, sans bloquer : le CLI est à jour avant que la
+    transcription (une dizaine de minutes) ne laisse la main à la synthèse.
+    synthetiser() attend la fin de cette étape avant de lancer claude, pour
+    ne pas exécuter un binaire en cours de remplacement."""
+
+    def poser(etat: str, texte: str) -> None:
+        _ETAT_CLAUDE.update(etat=etat, texte=texte)
+        noter(f"claude (démarrage) : {texte}")
+        if signaler:
+            try:
+                signaler(dict(_ETAT_CLAUDE))
+            except Exception:
+                pass
+
+    try:
+        claude = chemin_claude()
+        if not claude:
+            poser("absent", "Claude Code introuvable — relance Installer.bat.")
+            return
+        avant = version_claude(claude)
+        poser("maj", f"Claude Code {avant or ''} : recherche de mise à jour…".replace("  ", " "))
+        code, sortie = _lancer_utilitaire([claude, "update"], 600)
+        noter(f"claude update (démarrage) : code {code} — {sortie.strip()[-200:]}")
+        apres = version_claude(claude)
+        if apres and avant and apres != avant:
+            poser("ok", f"Claude Code mis à jour : {avant} → {apres}.")
+        elif code == 0 and apres:
+            poser("ok", f"Claude Code {apres} · à jour.")
+        else:
+            poser("echec", f"Claude Code {apres or avant or ''} : mise à jour impossible "
+                           "pour l'instant (hors ligne ?) — la version installée "
+                           "sera utilisée.".replace("  ", " "))
+    except Exception as exc:  # noqa: BLE001
+        poser("echec", f"Claude Code : vérification impossible ({str(exc)[:80]}).")
+    finally:
+        _MAJ_CLAUDE_FINIE.set()
+
+
+def _texte_resultat(ev: dict[str, Any]) -> str:
+    """Le texte porté par un événement `result`, quelle que soit sa forme."""
+    r = ev.get("result")
+    if isinstance(r, str):
+        return r
+    if isinstance(r, list):  # certaines versions renvoient des blocs
+        return "".join(b.get("text") or "" for b in r
+                       if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _expliquer(message: str, code: Optional[int]) -> str:
+    """Traduit les erreurs connues de Claude Code en consigne actionnable."""
+    bas = message.lower()
+    if re.search(r"usage limit|rate limit|limit (will )?reset|hit your limit|"
+                 r"limite d.utilisation|too many requests|429", bas):
+        return ("Limite d'utilisation de ton abonnement Claude atteinte. "
+                "Attends la réinitialisation puis « Relancer la synthèse ». "
+                f"({message[:160]})")
+    if re.search(r"not logged in|log ?in|authenticat|api key|unauthori|401|"
+                 r"invalid.*token|oauth", bas):
+        return ("Claude Code n'est pas connecté. Ouvre une invite de commandes, "
+                "tape 'claude' et suis la procédure de connexion.")
+    if "max_turns" in bas or "maximum number of turns" in bas or "max turns" in bas:
+        return ("Claude a dépassé le nombre de tours autorisés avant de terminer. "
+                "Relance la synthèse ; si ça se reproduit, la transcription est "
+                "peut-être trop longue pour une seule passe.")
+    if re.search(r"prompt is too long|context (window|length)|too many tokens|"
+                 r"exceeds.*(context|maximum)", bas):
+        return ("Transcription trop longue pour une seule passe de Claude. "
+                "Coupe l'audio en deux et relance chaque moitié.")
+    if re.search(r"overloaded|529|503|502|econnreset|enotfound|etimedout|"
+                 r"network|fetch failed|socket", bas):
+        return ("Claude est injoignable ou surchargé pour le moment. "
+                f"Réessaie dans quelques minutes. ({message[:160]})")
+    if not message.strip():
+        return f"Claude Code s'est arrêté sans message (code {code})."
+    return message
+
+
 def _appeler_claude(t: Traitement, commande: list[str], transcription: Path,
                     jalons: Jalons) -> tuple[str, dict[str, Any]]:
     debut = time.time()
+    journal = t.dossier / JOURNAL_SYNTHESE
+    inactivite = INACTIVITE_MAX if "stream-json" in commande else None
+
+    def tracer(*morceaux: str) -> None:
+        try:
+            with journal.open("a", encoding="utf-8") as fh:
+                for m in morceaux:
+                    fh.write(m.rstrip("\n") + "\n")
+        except Exception:
+            pass
+
+    tracer("", f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} === "
+              + subprocess.list2cmdline(commande[:2] + ["<consigne>"] + commande[3:]),
+           f"stdin : {transcription} ({transcription.stat().st_size} octets)")
+
     with transcription.open("rb") as stdin:
         proc = suivre(subprocess.Popen(
             commande, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -605,33 +790,84 @@ def _appeler_claude(t: Traitement, commande: list[str], transcription: Path,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         ))
 
-    minuterie = threading.Timer(1800, proc.kill)
-    minuterie.daemon = True
-    minuterie.start()
+    # stderr est vidé à part : s'il se remplissait sans lecteur, Claude se
+    # bloquerait en écriture et on attendrait un résultat qui ne vient jamais.
+    erreurs_brutes: list[str] = []
 
-    lignes: list[str] = []
+    def _drainer() -> None:
+        try:
+            for l in proc.stderr:  # type: ignore[union-attr]
+                erreurs_brutes.append(l)
+        except Exception:
+            pass
+
+    drain = threading.Thread(target=_drainer, daemon=True)
+    drain.start()
+
+    # Garde-fou : par inactivité (rien reçu depuis INACTIVITE_MAX) ou par durée
+    # absolue, et en tuant tout l'arbre — sinon node survit à claude.cmd.
+    garde = {"dernier": time.time(), "motif": ""}
+
+    def _veiller() -> None:
+        while True:
+            time.sleep(5)
+            if proc.poll() is not None:   # fini entre-temps : rien à faire
+                return
+            maintenant = time.time()
+            motif = ""
+            if maintenant - debut > DUREE_MAX:
+                motif = f"durée maximale de {DUREE_MAX // 60} min dépassée"
+            elif inactivite and maintenant - garde["dernier"] > inactivite:
+                motif = f"plus aucune sortie de Claude depuis {inactivite // 60} min"
+            if motif:
+                garde["motif"] = motif
+                tracer(f"--- interruption : {motif}")
+                tuer(proc, motif)
+                return
+
+    threading.Thread(target=_veiller, daemon=True).start()
+
+    lignes: list[str] = []          # lignes hors flux de deltas
     resultat: Optional[dict[str, Any]] = None
+    texte_assistant = ""            # blocs texte des messages complets
+    texte_deltas = ""               # reconstruit depuis les deltas
+    nb_deltas = 0
     partiel = ""
     section = 0
 
     try:
         for ligne in proc.stdout:  # type: ignore[union-attr]
+            garde["dernier"] = time.time()
             ligne = ligne.strip()
             if not ligne:
                 continue
-            lignes.append(ligne)
             try:
                 ev = json.loads(ligne)
             except json.JSONDecodeError:
+                lignes.append(ligne)
+                tracer(ligne)
                 continue
             if not isinstance(ev, dict):
+                lignes.append(ligne)
+                tracer(ligne)
                 continue
-            if ev.get("type") == "result":
+
+            genre = ev.get("type")
+            if genre == "stream_event":
+                nb_deltas += 1
+            else:
+                lignes.append(ligne)
+                tracer(ligne)
+            if genre == "result":
                 resultat = ev
 
             morceau = _fragment(ev)
             if not morceau:
                 continue
+            if genre == "assistant":
+                texte_assistant += morceau
+            else:
+                texte_deltas += morceau
             partiel += morceau
             if "\n" in partiel:
                 complet, _, partiel = partiel.rpartition("\n")
@@ -642,35 +878,72 @@ def _appeler_claude(t: Traitement, commande: list[str], transcription: Path,
                   detail=(jalons.etiquette(section) if section
                           else f"Rédaction… {ecoule} s"))
     finally:
-        minuterie.cancel()
-        erreurs = proc.stderr.read() if proc.stderr else ""  # type: ignore[union-attr]
         proc.wait()
+        drain.join(5)
+        erreurs = "".join(erreurs_brutes).strip()
+        tracer(f"--- fin : code {proc.returncode}, {int(time.time() - debut)} s, "
+               f"{nb_deltas} deltas non journalisés",
+               *(["--- stderr :", erreurs] if erreurs else []))
 
-    if proc.returncode != 0:
-        message = (erreurs or "\n".join(lignes)).strip()
-        if re.search(r"unknown (option|argument)|unrecognized|--\w[\w-]* is not",
-                     message, re.I):
-            raise _OptionInconnue(message)
-        if "login" in message.lower() or "auth" in message.lower():
-            message = ("Claude Code n'est pas connecté. Ouvre une invite de commandes, "
-                       "tape 'claude' et suis la procédure de connexion.")
-        raise RuntimeError(message[:400] or "Claude Code s'est arrêté sans message.")
-
-    if resultat is None:  # sortie JSON d'un seul bloc, non streamée
+    if resultat is None and lignes:  # sortie JSON d'un seul bloc, non streamée
         try:
             charge = json.loads("\n".join(lignes))
             resultat = charge if isinstance(charge, dict) else None
         except json.JSONDecodeError:
             resultat = None
 
-    if resultat is None:
-        return "\n".join(lignes), {}
+    markdown = _texte_resultat(resultat) if resultat else ""
+    if not markdown.strip():
+        markdown = texte_assistant or texte_deltas
+    en_erreur = bool(resultat and resultat.get("is_error"))
 
-    markdown = resultat.get("result") or ""
-    u = resultat.get("usage") or {}
-    usage = {"entree": u.get("input_tokens"), "sortie": u.get("output_tokens"),
-             "duree": resultat.get("duration_ms")}
-    return markdown, usage
+    # Un vrai résultat prime sur le code de sortie : si seul le wrapper
+    # claude.cmd est mort, node a quand même livré la synthèse.
+    if markdown.strip() and not en_erreur and not garde["motif"]:
+        if proc.returncode != 0:
+            noter(f"claude : code {proc.returncode} mais résultat complet, on le garde")
+        u = (resultat or {}).get("usage") or {}
+        usage = {"entree": u.get("input_tokens"), "sortie": u.get("output_tokens"),
+                 "duree": (resultat or {}).get("duration_ms")}
+        return markdown, usage
+
+    # --- échec : reconstituer le message le plus parlant -------------------
+    if en_erreur:
+        message = (_texte_resultat(resultat)
+                   or " ".join(str(e) for e in (resultat.get("errors") or []))
+                   or str(resultat.get("subtype") or "")).strip()
+    elif erreurs:
+        message = erreurs
+    else:
+        # Les lignes JSON d'amorce (system/init…) n'apprennent rien : on
+        # montre ce qui vient après, ou rien.
+        utiles = [l for l in lignes
+                  if not l.startswith('{"type":"system"')
+                  and not l.startswith('{"type":"assistant"')]
+        message = "\n".join(utiles[-3:])
+
+    if re.search(r"unknown (option|argument)|unrecognized|--\w[\w-]* is not",
+                 message + " " + erreurs, re.I):
+        raise _OptionInconnue(message or erreurs)
+    if _RE_CLI_OBSOLETE.search(message + " " + erreurs):
+        noter(f"claude : CLI obsolète — {message[:200]}")
+        raise _CliObsolete(message or erreurs)
+
+    if garde["motif"]:
+        message = f"Synthèse interrompue : {garde['motif']}."
+    else:
+        message = _expliquer(message, proc.returncode)
+
+    brouillon = texte_assistant or texte_deltas
+    if len(brouillon.strip()) > 200:
+        try:
+            (t.dossier / PARTIEL_SYNTHESE).write_text(brouillon, encoding="utf-8")
+            message += f" Le texte déjà rédigé est dans {PARTIEL_SYNTHESE}."
+        except Exception:
+            pass
+    message += f" Détail : {JOURNAL_SYNTHESE} dans le dossier du cours."
+    noter(f"claude : échec (code {proc.returncode}) — {message[:300]}")
+    raise RuntimeError(message[:400])
 
 
 def synthetiser(t: Traitement, transcription: Path) -> Path:
@@ -680,13 +953,21 @@ def synthetiser(t: Traitement, transcription: Path) -> Path:
             "Claude Code est introuvable. Relance Installer.bat, ou installe-le "
             "avec : npm install -g @anthropic-ai/claude-code")
 
+    # Une mise à jour lancée au démarrage est peut-être encore en train de
+    # remplacer le binaire : on ne l'exécute pas avant qu'elle ait fini.
+    if not _MAJ_CLAUDE_FINIE.is_set():
+        t.maj("synthese", statut="en_cours", detail="Mise à jour de Claude Code…")
+        _MAJ_CLAUDE_FINIE.wait(600)
+
     t.maj("synthese", statut="en_cours", detail="Claude lit la transcription")
 
     # La copie posée dans le dossier du cours fait foi ; le fichier de
     # l'application sert de secours.
     jalons = Jalons.depuis(t.dossier / "CLAUDE.md", CLAUDE_MD)
 
-    base = [claude, "-p", CONSIGNE, "--max-turns", "6"]
+    # 12 tours : Claude n'a besoin que d'un seul, mais s'il décide de relire
+    # CLAUDE.md ou la transcription par morceaux, 6 ne suffisaient plus.
+    base = [claude, "-p", CONSIGNE, "--max-turns", "12"]
     # Du plus bavard au plus sobre : chaque repli perd un peu d'avancement
     # mais reste fonctionnel sur une version plus ancienne du CLI.
     tentatives = [
@@ -696,19 +977,41 @@ def synthetiser(t: Traitement, transcription: Path) -> Path:
         base + ["--output-format", "json"],
     ]
 
-    derniere: Optional[Exception] = None
-    for commande in tentatives:
-        try:
-            markdown, usage = _appeler_claude(t, commande, transcription, jalons)
-            break
-        except _OptionInconnue as exc:
-            derniere = exc
-    else:
+    def essayer() -> tuple[str, dict[str, Any]]:
+        derniere: Optional[Exception] = None
+        for commande in tentatives:
+            try:
+                return _appeler_claude(t, commande, transcription, jalons)
+            except _OptionInconnue as exc:
+                derniere = exc
         raise RuntimeError(str(derniere)[:400] if derniere else
                            "Claude Code n'a accepté aucun format de sortie.")
 
+    try:
+        markdown, usage = essayer()
+    except _CliObsolete as exc:
+        # L'API refuse le modèle à cette version du CLI : on met à jour et
+        # on refait un essai, une seule fois.
+        nouvelle = mettre_a_jour_claude(
+            claude, lambda d: t.maj("synthese", statut="en_cours", detail=d))
+        if not nouvelle:
+            raise RuntimeError(
+                "Claude Code est trop ancien pour ce modèle et sa mise à jour "
+                "automatique a échoué. Dans une invite de commandes : "
+                "claude update  (ou : npm install -g @anthropic-ai/claude-code@latest), "
+                f"puis « Relancer la synthèse ». ({str(exc)[:120]})") from exc
+        t.maj("synthese", statut="en_cours",
+              detail=f"Claude Code {nouvelle} — nouvel essai")
+        try:
+            markdown, usage = essayer()
+        except _CliObsolete as exc2:
+            raise RuntimeError(
+                f"Claude Code {nouvelle} refuse toujours ce modèle. "
+                f"({str(exc2)[:200]})") from exc2
+
     if not markdown.strip():
-        raise RuntimeError("Claude a renvoyé une réponse vide.")
+        raise RuntimeError("Claude a renvoyé une réponse vide. "
+                           f"Détail : {JOURNAL_SYNTHESE} dans le dossier du cours.")
 
     t.usage = usage
     sortie = t.dossier / f"{t.audio.stem}.md"
@@ -716,6 +1019,7 @@ def synthetiser(t: Traitement, transcription: Path) -> Path:
     t.fichiers["md"] = str(sortie)
     t.maj("synthese", statut="fait", avancement=1.0,
           detail=f"{len(markdown.split())} mots")
+    noter(f"synthèse : {sortie.name}, {len(markdown.split())} mots")
     return sortie
 
 
@@ -788,6 +1092,10 @@ class Passerelle:
             return None
         return self._decrire(resultat[0])
 
+    def etat_claude(self) -> dict[str, str]:
+        """Où en est la vérification de Claude Code lancée au démarrage."""
+        return dict(_ETAT_CLAUDE)
+
     def fichier_initial(self) -> Optional[dict[str, Any]]:
         """Audio déposé sur le raccourci du bureau ou passé en argument."""
         noter(f"appel fichier_initial : {sys.argv[1:]!r}")
@@ -799,6 +1107,14 @@ class Passerelle:
         p = Path(chemin)
         if not p.is_file():
             return {"erreur": "Fichier introuvable."}
+        if p.suffix.lower() == ".txt":
+            # Une transcription déjà produite : on ne refera que la synthèse.
+            entete = _entete_transcription(p)
+            if not entete.get("mots"):
+                return {"erreur": "Ce fichier texte est vide."}
+            return {"chemin": str(p), "nom": p.name, "reprise": True,
+                    "taille": round(p.stat().st_size / 1024),
+                    "mots": entete["mots"], "matiere": entete.get("matiere", "")}
         # FFmpeg lit bien plus de formats que la liste ci-dessus : on laisse
         # passer, c'est le decodage qui tranchera avec un message clair.
         if p.suffix.lower() not in AUDIO_EXT and p.stat().st_size < 4096:
@@ -810,11 +1126,40 @@ class Passerelle:
     def lancer(self, options: dict[str, Any]) -> dict[str, Any]:
         noter(f"appel lancer : {options.get('chemin')!r}, "
               f"modèle {options.get('modele')!r}")
-        audio = Path(options.get("chemin", ""))
-        if not audio.exists():
+        source = Path(options.get("chemin", ""))
+        if not source.exists():
             return {"erreur": "Fichier introuvable."}
 
-        dossier = SORTIE / f"{time.strftime('%Y-%m-%d')}_{audio.stem[:60]}"
+        if source.suffix.lower() == ".txt":
+            return self._reprendre(source, options)
+
+        dossier = self._nouveau_dossier(source.stem)
+        self._courant = Traitement(source, dossier, options, self._pousser)
+        threading.Thread(target=self._pipeline, args=(self._courant,), daemon=True).start()
+        return self._courant.instantane()
+
+    def relancer_synthese(self) -> dict[str, Any]:
+        """Après un échec de la synthèse : on repart de la transcription déjà
+        faite, dans le même dossier, sans refaire passer l'audio au GPU."""
+        t = self._courant
+        noter("appel relancer_synthese")
+        if not t or t.etat == "en_cours":
+            return {"erreur": "Rien à relancer."}
+        transcription = Path(t.fichiers.get("txt") or t.dossier / "transcription.txt")
+        if not transcription.exists():
+            return {"erreur": "transcription.txt est introuvable : relance le cours "
+                              "depuis l'audio."}
+        t.etat, t.erreur, t.usage = "en_cours", None, {}
+        t.fichiers = {"txt": str(transcription)}
+        for nom in ("synthese", "pdf"):
+            t.etapes[nom] = {"statut": "attente", "avancement": 0.0, "detail": ""}
+        threading.Thread(target=self._pipeline, args=(t, transcription),
+                         daemon=True).start()
+        return t.instantane()
+
+    # -- interne -------------------------------------------------------
+    def _nouveau_dossier(self, nom: str) -> Path:
+        dossier = SORTIE / f"{time.strftime('%Y-%m-%d')}_{nom[:60]}"
         n = 2
         while dossier.exists():
             dossier = dossier.with_name(f"{dossier.name.rstrip('0123456789_')}_{n}")
@@ -822,10 +1167,44 @@ class Passerelle:
         dossier.mkdir(parents=True, exist_ok=True)
         if CLAUDE_MD.exists():
             shutil.copy(CLAUDE_MD, dossier / "CLAUDE.md")
+        return dossier
 
-        self._courant = Traitement(audio, dossier, options, self._pousser)
-        threading.Thread(target=self._pipeline, args=(self._courant,), daemon=True).start()
-        return self._courant.instantane()
+    def _reprendre(self, texte: Path, options: dict[str, Any]) -> dict[str, Any]:
+        """Un transcription.txt choisi à la place de l'audio : la synthèse se
+        refait dans son dossier de cours s'il en vient, sinon dans un nouveau."""
+        entete = _entete_transcription(texte)
+        if not entete.get("mots"):
+            return {"erreur": "Ce fichier texte est vide."}
+
+        dans_un_cours = (texte.name == "transcription.txt"
+                         and texte.parent != SORTIE
+                         and texte.parent.parent == SORTIE)
+        if dans_un_cours:
+            dossier = texte.parent
+            transcription = texte
+            if CLAUDE_MD.exists() and not (dossier / "CLAUDE.md").exists():
+                shutil.copy(CLAUDE_MD, dossier / "CLAUDE.md")
+        else:
+            dossier = self._nouveau_dossier(texte.stem)
+            transcription = dossier / "transcription.txt"
+            shutil.copy(texte, transcription)
+
+        # Le nom de l'audio d'origine est dans l'en-tête ; à défaut, celui du
+        # dossier sans sa date sert de nom au support.
+        nom_audio = entete.get("fichier") or re.sub(r"^\d{4}-\d{2}-\d{2}_", "", dossier.name)
+        audio = dossier / nom_audio
+        if audio.suffix.lower() in (".txt", ".md"):
+            audio = audio.with_suffix("")
+        options = dict(options, matiere=options.get("matiere") or entete.get("matiere", ""))
+
+        t = Traitement(audio, dossier, options, self._pousser)
+        t.fichiers["txt"] = str(transcription)
+        t.etapes["transcription"] = {"statut": "fait", "avancement": 1.0,
+                                     "detail": f"reprise · {entete['mots']} mots"}
+        self._courant = t
+        threading.Thread(target=self._pipeline, args=(t, transcription),
+                         daemon=True).start()
+        return t.instantane()
 
     def lire(self, genre: str) -> str:
         if not self._courant:
@@ -844,7 +1223,6 @@ class Passerelle:
         except Exception:
             subprocess.Popen(["explorer", chemin], creationflags=NO_WINDOW)
 
-    # -- interne -------------------------------------------------------
     def _pousser(self, instantane: dict[str, Any]) -> None:
         if not self._fenetre:
             return
@@ -854,16 +1232,30 @@ class Passerelle:
         except Exception:
             pass
 
-    def _pipeline(self, t: Traitement) -> None:
-        noter(f"pipeline : {t.audio.name} -> {t.dossier}")
-        try:
-            transcription = transcrire(t)
-        except Exception as exc:  # noqa: BLE001
-            t.echec("transcription", _lisible(exc))
+    def _pousser_claude(self, etat: dict[str, str]) -> None:
+        """Avant que la page soit chargée, evaluate_js échoue : l'interface
+        redemande alors l'état par etat_claude() dès qu'elle est prête."""
+        if not self._fenetre:
             return
+        charge = json.dumps(etat, ensure_ascii=False)
+        try:
+            self._fenetre.evaluate_js(f"window.majClaude && window.majClaude({charge})")
+        except Exception:
+            pass
+
+    def _pipeline(self, t: Traitement, transcription: Optional[Path] = None) -> None:
+        noter(f"pipeline : {t.audio.name} -> {t.dossier}"
+              + (" (reprise depuis la transcription)" if transcription else ""))
+        if transcription is None:
+            try:
+                transcription = transcrire(t)
+            except Exception as exc:  # noqa: BLE001
+                t.echec("transcription", _lisible(exc))
+                return
         try:
             markdown = synthetiser(t, transcription)
         except Exception as exc:  # noqa: BLE001
+            noter("synthèse : échec — " + str(exc)[:300])
             t.echec("synthese", _lisible(exc))
             return
         try:
@@ -873,6 +1265,25 @@ class Passerelle:
 
         t.etat = "fini"
         t.notifier(t.instantane())
+
+
+def _entete_transcription(chemin: Path) -> dict[str, Any]:
+    """Relit l'en-tête écrit par _transcrire (« Cours : », « Fichier : »)
+    et compte les mots. Tolère un texte quelconque sans en-tête."""
+    infos: dict[str, Any] = {}
+    try:
+        texte = chemin.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return infos
+    for ligne in texte.splitlines()[:5]:
+        m = re.match(r"^(Cours|Fichier|Durée)\s*:\s*(.+?)\s*$", ligne)
+        if m:
+            cle = {"Cours": "matiere", "Fichier": "fichier", "Durée": "duree"}[m.group(1)]
+            infos[cle] = m.group(2)
+    if infos.get("matiere") in ("à préciser", ""):
+        infos["matiere"] = ""
+    infos["mots"] = len(texte.split())
+    return infos
 
 
 def _lisible(exc: Exception) -> str:
@@ -930,6 +1341,12 @@ def main() -> None:
 
     # La fenetre n'existe pas encore : un guetteur la reconnaitra a son titre.
     threading.Thread(target=poser_icone, daemon=True).start()
+
+    # Claude Code ne se met à jour qu'en session interactive — et ici il n'en
+    # a jamais : on s'en charge à chaque lancement, en arrière-plan.
+    _MAJ_CLAUDE_FINIE.clear()
+    threading.Thread(target=maj_claude_en_arriere_plan,
+                     args=(passerelle._pousser_claude,), daemon=True).start()
 
     noter("fenêtre créée, ouverture")
     webview.start()
