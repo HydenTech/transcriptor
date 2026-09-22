@@ -46,7 +46,8 @@ REM --- 3. Bibliotheques ---------------------------------------------
 echo   [3/5] Moteur de transcription et interface
 python -m pip install --quiet ^
     "pywebview>=5.1" "faster-whisper>=1.1" "markdown>=3.5" "playwright>=1.44" ^
-    "nvidia-cublas-cu12" "nvidia-cudnn-cu12>=9,<10"
+    "nvidia-cublas-cu12" "nvidia-cudnn-cu12>=9,<10" ^
+    "python-pptx>=1.0" "pillow>=10" "pillow-heif>=0.16" "pyyaml>=6"
 if errorlevel 1 (
     echo   Installation des bibliotheques echouee. Verifie ta connexion.
     pause & exit /b 1

@@ -138,6 +138,48 @@ li[data-statut="erreur"] .step-detail{color:var(--red)}
 .alert{border-left:3px solid var(--red);background:#FDF4F2;padding:12px 15px;
   margin-top:15px;font-size:14px;-webkit-user-select:text;user-select:text}
 
+/* supports du cours */
+.supports{margin-top:14px;border:1px solid var(--rule-2);border-radius:3px;padding:14px 16px;
+  background:#FCFDFA}
+.supports[hidden]{display:none}
+.ligne{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ligne .grow{flex:1;min-width:0}
+.facultatif{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--ink-2);font-weight:400;margin-left:6px}
+.mini{font-family:var(--mono);font-size:11.5px;color:var(--ink);background:#fff;
+  border:1px solid var(--rule);padding:6px 10px;border-radius:2px;cursor:pointer;white-space:nowrap}
+.mini:hover{border-color:var(--ink)}
+.mini:disabled{opacity:.35;cursor:not-allowed}
+ul.fichiers{list-style:none;margin:10px 0 0;padding:0}
+ul.fichiers:empty{display:none}
+ul.fichiers li{display:grid;grid-template-columns:auto 1fr auto auto;gap:10px;align-items:center;
+  padding:6px 0;border-top:1px solid var(--rule-2);font-size:13.5px}
+ul.fichiers li:first-child{border-top:none}
+.genre{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+  padding:2px 6px;border-radius:2px;background:#EEF1E8;color:var(--ink-2)}
+.genre[data-g="photo"]{background:#FFE3EE}
+.genre[data-g="diapos"],.genre[data-g="pdf"]{background:#DDF4F6}
+.genre[data-g="notes"]{background:#F4F9C8}
+ul.fichiers .nom{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ul.fichiers .poids{font-family:var(--mono);font-size:11.5px;color:var(--ink-2)}
+ul.fichiers .ko{color:var(--red);font-size:12.5px}
+.retirer{border:none;background:none;color:var(--ink-2);font-size:17px;line-height:1;
+  cursor:pointer;padding:0 4px}
+.retirer:hover{color:var(--red)}
+
+/* consignes */
+.dupliquer{margin-top:8px}
+.dupliquer[hidden]{display:none}
+.avert{font-size:12px;color:var(--red);margin:0}
+.avert:empty{display:none}
+.meta{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);margin:-6px 0 12px}
+.meta:empty{display:none}
+ul.remarques{margin:12px 0 0;padding:10px 14px 10px 30px;background:#FBFCF6;
+  border-left:3px solid var(--hi-yellow);font-size:13px}
+ul.remarques:empty{display:none}
+ol.steps li[data-cache="1"]{display:none}
+.md .img-ph{font-family:var(--mono);font-size:12px;color:var(--ink-2)}
+
 @media (max-width:600px){
   .fields{grid-template-columns:1fr}
   ol.steps li{grid-template-columns:22px 1fr;row-gap:2px}
@@ -152,8 +194,9 @@ li[data-statut="erreur"] .step-detail{color:var(--red)}
   <header>
     <p class="eyebrow">Transcriptor</p>
     <h1>De l'auditoire à la <span class="swipe">fiche</span>, sans rien retaper.</h1>
-    <p class="lede">Choisis l'enregistrement du cours. Il est transcrit sur ta carte
-      graphique, puis mis en forme selon les règles du fichier CLAUDE.md.</p>
+    <p class="lede">Choisis l'enregistrement du cours, et si tu les as, les diapos ou
+      les photos du tableau. L'audio est transcrit sur ta carte graphique, puis Claude
+      croise le tout et rédige selon le modèle de consignes choisi.</p>
   </header>
 
   <section class="panel" id="panel-choix">
@@ -162,7 +205,19 @@ li[data-statut="erreur"] .step-detail{color:var(--red)}
     <div class="pick" id="pick" tabindex="0" role="button">
       <strong>Choisir l'enregistrement</strong>
       <span>MP3, WAV, M4A, OGG, FLAC ou OPUS — jusqu'à trois heures.<br>
-        Ou un <code>transcription.txt</code> déjà produit, pour ne refaire que la synthèse.</span>
+        Ou un <code>transcription.txt</code> déjà produit, pour ne refaire que la synthèse,
+        ou un résumé <code>.md</code>, pour ne refaire que le PDF.</span>
+    </div>
+
+    <div class="supports" id="bloc-supports">
+      <div class="ligne">
+        <label class="grow">Supports du cours <span class="facultatif">facultatif</span></label>
+        <button class="mini" id="ajouter-supports" type="button">Ajouter des diapos ou photos</button>
+      </div>
+      <p class="hint">PowerPoint (.pptx), PDF, photos du tableau (JPG, PNG, HEIC), notes
+        (.txt, .md). Claude les lit et les croise avec la transcription : termes corrigés,
+        formules et schémas complétés, renvois « diapo 12 », « photo 2 ».</p>
+      <ul class="fichiers" id="liste-supports"></ul>
     </div>
 
     <div class="fields">
@@ -179,11 +234,27 @@ li[data-statut="erreur"] .step-detail{color:var(--red)}
         </select>
       </div>
       <div class="field wide">
+        <label for="consignes">Consignes de synthèse</label>
+        <div class="ligne">
+          <select id="consignes" class="grow"><option>Chargement…</option></select>
+          <button class="mini" id="c-modifier" type="button" title="Ouvrir le fichier .md dans ton éditeur">Modifier</button>
+          <button class="mini" id="c-dupliquer" type="button" title="Créer un nouveau modèle à partir de celui-ci">Dupliquer</button>
+          <button class="mini" id="c-dossier" type="button" title="Ouvrir le dossier des modèles">Dossier</button>
+        </div>
+        <div class="ligne dupliquer" id="c-form" hidden>
+          <input id="c-nom" class="grow" placeholder="Nom du nouveau modèle" autocomplete="off">
+          <button class="mini" id="c-creer" type="button">Créer et ouvrir</button>
+          <button class="mini" id="c-annuler" type="button">Annuler</button>
+        </div>
+        <p class="hint" id="c-description"></p>
+        <p class="avert" id="c-avert"></p>
+      </div>
+      <div class="field wide">
         <label for="termes">Vocabulaire du chapitre</label>
         <textarea id="termes" placeholder="ArrayList&lt;String&gt;, HashMap, try/catch, throws Exception, System.out.println, polymorphisme"></textarea>
         <p class="hint">Whisper recopie la casse qu'il lit ici. Écris les termes
           exactement comme tu veux les retrouver — c'est ce qui sauve le camelCase.
-          Une trentaine de termes maximum.</p>
+          Une trentaine de termes maximum. Les titres des diapos jointes s'y ajoutent.</p>
       </div>
     </div>
 
@@ -194,7 +265,13 @@ li[data-statut="erreur"] .step-detail{color:var(--red)}
 
   <section class="panel" id="panel-etapes" hidden>
     <p class="panel-title">En cours</p>
+    <p class="meta" id="meta-cours"></p>
     <ol class="steps">
+      <li data-etape="supports" data-statut="ignore" data-cache="1">
+        <span class="num">00</span>
+        <span class="step-label"><span class="swipe" style="--fill:0">Supports</span></span>
+        <span class="step-detail"></span>
+      </li>
       <li data-etape="transcription" data-statut="attente">
         <span class="num">01</span>
         <span class="step-label"><span class="swipe" style="--fill:0">Transcription</span></span>
@@ -211,6 +288,7 @@ li[data-statut="erreur"] .step-detail{color:var(--red)}
         <span class="step-detail"></span>
       </li>
     </ol>
+    <ul class="remarques" id="remarques"></ul>
     <div id="erreur-etapes"></div>
   </section>
 
@@ -225,6 +303,8 @@ li[data-statut="erreur"] .step-detail{color:var(--red)}
       <button class="action action--fort" id="ouvrir-pdf">Ouvrir le PDF</button>
       <button class="action" id="ouvrir-dossier">Ouvrir le dossier</button>
       <button class="action" id="copier">Copier le Markdown</button>
+      <button class="action" id="refaire-pdf" title="Remettre en page avec l'en-tête pdf: actuel des consignes">Refaire le PDF</button>
+      <button class="action" id="modifier-consignes-cours">Modifier les consignes</button>
       <button class="action" id="encore">Un autre cours</button>
     </div>
     <p class="usage" id="usage"></p>
@@ -235,10 +315,14 @@ li[data-statut="erreur"] .step-detail{color:var(--red)}
 <script>
 const $ = (s) => document.querySelector(s);
 let api = null, choisi = null, cache = {md:"", txt:""};
+let supports = [];                 // [{chemin, nom, genre, taille, erreur?}]
+let idCourant = null;              // traitement affiché : les autres sont ignorés
+let modeles = [];                  // [{nom, description, avertissement, sections}]
 
 window.addEventListener("pywebviewready", async () => {
   api = window.pywebview.api;
   suivreClaude();
+  chargerConsignes();
   try {
     const initial = await api.fichier_initial();
     if (initial && initial.chemin) retenir(initial);
@@ -274,6 +358,93 @@ window.addEventListener("unhandledrejection", (e) =>
 window.addEventListener("error", (e) =>
   ($("#erreur-choix").innerHTML = alerte("Erreur interne : " + (e.message || ""))));
 
+/* ---------- consignes de synthèse ---------- */
+/* Un fichier .md par modèle, dans Documents\Transcriptor\Consignes. La liste
+   est relue quand la fenêtre revient au premier plan : un modèle ajouté ou
+   renommé dans l'Explorateur apparaît sans relancer l'application. */
+async function chargerConsignes(garder) {
+  if (!api) return;
+  try {
+    const r = await api.lister_consignes();
+    modeles = r.modeles || [];
+    const sel = $("#consignes");
+    const voulu = garder || sel.value || r.choisi;
+    sel.innerHTML = modeles.length
+      ? modeles.map(m => `<option value="${echapper(m.nom)}">${echapper(m.nom)}</option>`).join("")
+      : `<option value="">Aucun modèle — ouvre le dossier</option>`;
+    sel.value = modeles.some(m => m.nom === voulu) ? voulu : (r.choisi || "");
+    decrireConsignes();
+  } catch (e) {
+    $("#c-avert").textContent = "Liste des consignes illisible : " + e;
+  }
+}
+function decrireConsignes() {
+  const m = modeles.find(x => x.nom === $("#consignes").value);
+  const parties = [];
+  if (m && m.description) parties.push(m.description);
+  if (m && m.sections) parties.push(`${m.sections} sections numérotées`);
+  $("#c-description").textContent = parties.join(" · ") ||
+    (m ? "Pas de description — ajoute « description: » en tête du fichier." : "");
+  $("#c-avert").textContent = m && m.avertissement ? "⚠ " + m.avertissement : "";
+  $("#c-modifier").disabled = $("#c-dupliquer").disabled = !m;
+  majBouton();
+}
+$("#consignes").addEventListener("change", () => {
+  decrireConsignes();
+  if (api && $("#consignes").value) api.retenir_consignes($("#consignes").value);
+});
+window.addEventListener("focus", () => chargerConsignes());
+$("#c-modifier").addEventListener("click", async () => {
+  const r = await api.modifier_consignes($("#consignes").value);
+  if (r && r.erreur) $("#c-avert").textContent = r.erreur;
+});
+$("#c-dossier").addEventListener("click", () => api.ouvrir_dossier_consignes());
+$("#c-dupliquer").addEventListener("click", () => {
+  $("#c-form").hidden = false;
+  $("#c-nom").value = $("#consignes").value + " (copie)";
+  $("#c-nom").focus(); $("#c-nom").select();
+});
+$("#c-annuler").addEventListener("click", () => ($("#c-form").hidden = true));
+$("#c-nom").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("#c-creer").click();
+  if (e.key === "Escape") $("#c-annuler").click();
+});
+$("#c-creer").addEventListener("click", async () => {
+  const r = await api.dupliquer_consignes($("#consignes").value, $("#c-nom").value);
+  if (r.erreur) { $("#c-avert").textContent = r.erreur; return; }
+  $("#c-form").hidden = true;
+  await chargerConsignes(r.nom);
+});
+
+/* ---------- supports du cours ---------- */
+const GENRES = {photo:"photo", diapos:"pptx", pdf:"pdf", notes:"notes", ppt:"ppt"};
+$("#ajouter-supports").addEventListener("click", async () => {
+  if (!api) return;
+  try {
+    const r = await api.choisir_supports();
+    for (const f of r || []) if (!supports.some(x => x.chemin === f.chemin)) supports.push(f);
+    afficherSupports();
+  } catch (e) {
+    $("#erreur-choix").innerHTML = alerte("Ajout des supports impossible : " + e);
+  }
+});
+function afficherSupports() {
+  $("#liste-supports").innerHTML = supports.map((f, i) => `
+    <li><span class="genre" data-g="${echapper(f.genre || "")}">${echapper(GENRES[f.genre] || "?")}</span>
+      <span class="nom" title="${echapper(f.chemin)}">${echapper(f.nom)}</span>
+      ${f.erreur ? `<span class="ko">${echapper(f.erreur)}</span>`
+                 : `<span class="poids">${echapper(f.taille || "")}</span>`}
+      <button class="retirer" data-i="${i}" title="Retirer" type="button">×</button></li>`).join("");
+  document.querySelectorAll(".retirer").forEach(b => b.addEventListener("click", () => {
+    supports.splice(+b.dataset.i, 1);
+    afficherSupports();
+  }));
+}
+
+function majBouton() {
+  $("#go").disabled = !choisi || !$("#consignes").value;
+}
+
 /* ---------- choix du fichier ---------- */
 $("#pick").addEventListener("click", ouvrirDialogue);
 $("#pick").addEventListener("keydown", (e) => {
@@ -297,7 +468,13 @@ function retenir(f) {
   $("#erreur-choix").innerHTML = "";
   const pick = $("#pick");
   pick.classList.add("filled");
-  if (f.reprise) {
+  $("#bloc-supports").hidden = !!f.pdf_seul;
+  if (f.pdf_seul) {
+    pick.innerHTML = `<strong>Mise en page seule</strong>
+      <span class="filename">${echapper(f.nom)} · ${f.mots.toLocaleString("fr-FR")} mots —
+      réglages pdf: des consignes choisies</span>`;
+    $("#go").textContent = "Refaire le PDF";
+  } else if (f.reprise) {
     pick.innerHTML = `<strong>Reprise — synthèse seule</strong>
       <span class="filename">${echapper(f.nom)} · ${f.mots.toLocaleString("fr-FR")} mots</span>`;
     $("#go").textContent = "Résumer la transcription";
@@ -312,7 +489,7 @@ function retenir(f) {
       if (devine.length > 2) $("#matiere").value = devine.slice(0, 60);
     }
   }
-  $("#go").disabled = false;
+  majBouton();
 }
 
 /* ---------- lancement ---------- */
@@ -325,8 +502,13 @@ $("#go").addEventListener("click", async () => {
     matiere: $("#matiere").value,
     termes: $("#termes").value,
     modele: $("#modele").value,
+    consignes: $("#consignes").value,
+    supports: choisi.pdf_seul ? [] : supports.filter(f => !f.erreur).map(f => f.chemin),
   });
   if (r.erreur) { $("#erreur-choix").innerHTML = alerte(r.erreur); $("#go").disabled = false; return; }
+  idCourant = r.id;
+  fini = false;
+  $("#panel-resultat").hidden = true;
   $("#panel-choix").hidden = true;
   $("#panel-etapes").hidden = false;
   window.majEtat(r);
@@ -338,10 +520,17 @@ $("#go").addEventListener("click", async () => {
 
 /* ---------- appelée par Python à chaque avancement ---------- */
 window.majEtat = function (t) {
+  // Une page rechargée (« Un autre cours ») peut encore recevoir la fin d'un
+  // traitement précédent : seul celui lancé depuis cette page compte.
+  if (idCourant === null || t.id !== idCourant) return;
+  $("#meta-cours").textContent = t.consignes ? `Consignes : ${t.consignes}` : "";
+  $("#remarques").innerHTML = (t.avertissements || [])
+    .map(a => `<li>${echapper(a)}</li>`).join("");
   for (const [nom, e] of Object.entries(t.etapes)) {
     const li = document.querySelector(`li[data-etape="${nom}"]`);
     if (!li) continue;
     li.dataset.statut = e.statut;
+    li.dataset.cache = (nom === "supports" && e.statut === "ignore" && (!e.detail || e.detail === "aucun")) ? "1" : "0";
     const fill = e.statut === "fait" ? 1
                : e.statut === "ignore" ? 0
                : e.avancement || (e.statut === "en_cours" ? 0.06 : 0);
@@ -417,6 +606,23 @@ function afficher(vue) {
 }
 
 $("#ouvrir-pdf").addEventListener("click", () => api.ouvrir("pdf"));
+$("#modifier-consignes-cours").addEventListener("click", () => api.modifier_consignes_du_cours());
+$("#refaire-pdf").addEventListener("click", async () => {
+  const b = $("#refaire-pdf");
+  b.disabled = true; b.textContent = "Mise en page…";
+  try {
+    const t = await api.refaire_pdf();
+    if (t.erreur) { $("#usage").textContent = t.erreur; return; }
+    window.majEtat(t);
+    $("#ouvrir-pdf").disabled = !t.fichiers.pdf;
+    $("#ouvrir-pdf").textContent = t.fichiers.pdf ? "Ouvrir le PDF" : "PDF non produit";
+    b.textContent = t.etapes.pdf.statut === "fait" ? "PDF refait" : "Échec — voir l'étape 03";
+  } catch (e) {
+    b.textContent = "Échec";
+  } finally {
+    setTimeout(() => { b.disabled = false; b.textContent = "Refaire le PDF"; }, 1800);
+  }
+});
 $("#ouvrir-dossier").addEventListener("click", () => api.ouvrir("dossier"));
 $("#encore").addEventListener("click", () => location.reload());
 $("#copier").addEventListener("click", async () => {
@@ -432,7 +638,7 @@ function echapper(s) {
 }
 function alerte(m) { return `<div class="alert">${echapper(m)}</div>`; }
 
-/* Rendu Markdown minimal, suffisant pour la structure du CLAUDE.md. */
+/* Rendu Markdown minimal, suffisant pour relire le support avant le PDF. */
 function rendre(src) {
   const blocs = [];
   src = src.replace(/```(\w*)\n([\s\S]*?)```/g, (_, l, code) => {
@@ -441,6 +647,7 @@ function rendre(src) {
   });
 
   const inline = (t) => echapper(t)
+    .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, '<span class="img-ph">[image : $1]</span>')
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|\W)\*([^*\n]+)\*/g, "$1<em>$2</em>")

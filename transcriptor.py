@@ -3,11 +3,17 @@
 """
 Transcriptor — application Windows.
 
-Audio d'un cours -> transcription GPU -> support de révision -> PDF.
+Audio d'un cours (+ diapos, photos du tableau, notes) -> transcription GPU
+-> support de révision rédigé par Claude selon un fichier de consignes -> PDF.
 Fenêtre native, aucun terminal, aucun WSL.
+
+Les consignes sont des fichiers Markdown de Documents\\Transcriptor\\Consignes :
+le corps est envoyé à Claude, l'en-tête `pdf:` règle la mise en page.
 """
 from __future__ import annotations
 
+import datetime
+import importlib
 import json
 import os
 import re
@@ -29,17 +35,23 @@ for _flux in ("stdout", "stderr"):
         setattr(sys, _flux, open(os.devnull, "w", encoding="utf-8"))
 
 APP_DIR = Path(__file__).resolve().parent
-CLAUDE_MD = APP_DIR / "CLAUDE.md"
-PDF_SCRIPT = APP_DIR / "scripts" / "generate_pdf.py"
+SCRIPTS = APP_DIR / "scripts"
+PDF_SCRIPT = SCRIPTS / "generate_pdf.py"
 ICONE = APP_DIR / "static" / "transcriptor.ico"
+MODELES_APP = APP_DIR / "consignes"      # modèles fournis avec l'application
+
+sys.path.insert(0, str(SCRIPTS))
+import entete  # noqa: E402  (en-tête des fichiers de consignes)
+import supports as sup  # noqa: E402  (diapos, photos, notes joints à l'audio)
 
 DOCUMENTS = Path(os.environ.get("USERPROFILE", Path.home())) / "Documents"
 SORTIE = Path(os.environ.get("TRANSCRIPTOR_SORTIE", DOCUMENTS / "Transcriptor"))
+CONSIGNES = SORTIE / "Consignes"          # modèles de l'utilisateur, modifiables
 
 AUDIO_EXT = (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".opus", ".mp4", ".aac",
              ".wma", ".mpeg", ".mpg", ".mpga", ".mp2", ".webm", ".mkv", ".mov",
              ".avi", ".wmv", ".aiff", ".aif", ".amr", ".3gp", ".m4b", ".m4v", ".ts")
-STEPS = ("transcription", "synthese", "pdf")
+STEPS = ("supports", "transcription", "synthese", "pdf")
 
 # Masque la fenêtre noire des sous-processus.
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
@@ -52,6 +64,12 @@ _model_cache: dict[str, Any] = {}
 # ----------------------------------------------------------------------
 BASE_LOCALE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Transcriptor"
 JOURNAL = BASE_LOCALE / "journal.log"
+REGLAGES = BASE_LOCALE / "reglages.json"
+# Répertoires de travail de Claude, un par synthèse : vides de tout CLAUDE.md
+# ou AGENTS.md, ils ne contiennent que les supports du cours. Seules les
+# consignes choisies comptent donc, quel que soit le dossier d'où l'on
+# reprend — et deux fenêtres ouvertes ne se marchent pas dessus.
+ATELIER = BASE_LOCALE / "atelier"
 
 _enfants: list[subprocess.Popen] = []
 _verrou_enfants = threading.Lock()
@@ -144,13 +162,21 @@ _HANDLE_FENETRE: dict[str, Any] = {}
 
 
 # Masques du filtre de la boîte « Ouvrir ».
-def _filtre_audio() -> list[tuple[str, str]]:
+def _filtres_principal() -> list[tuple[str, str]]:
     return [("Fichiers audio", ";".join(f"*{e}" for e in AUDIO_EXT)),
-            ("Transcription déjà produite", "*.txt"),
+            ("Transcription déjà produite — synthèse seule", "*.txt"),
+            ("Résumé déjà produit — PDF seul", "*.md"),
             ("Tous les fichiers", "*.*")]
 
 
-def choisir_fichier_natif(titre: str = "Choisir l'enregistrement") -> Optional[str]:
+def _filtres_supports() -> list[tuple[str, str]]:
+    return [("Diapos, photos du tableau, notes",
+             ";".join(f"*{e}" for e in sorted(sup.EXT_SUPPORTS))),
+            ("Tous les fichiers", "*.*")]
+
+
+def choisir_fichier_natif(titre: str, filtres: list[tuple[str, str]],
+                          multiple: bool = False) -> Optional[list[str]]:
     """Boîte « Ouvrir » de Windows, affichée sur un thread STA dédié.
 
     pywebview exécute les appels venus du JavaScript sur un thread Python
@@ -160,7 +186,7 @@ def choisir_fichier_natif(titre: str = "Choisir l'enregistrement") -> Optional[s
     qui fait tomber l'application au clic sur « choisir l'enregistrement ».
     On ouvre donc la boîte nous-mêmes, sur un thread correctement initialisé.
 
-    Renvoie le chemin choisi, None si annulé, et lève RuntimeError si la
+    Renvoie les chemins choisis, None si annulé, et lève RuntimeError si la
     boîte n'a pas pu s'ouvrir — l'appelant retombera alors sur pywebview.
     """
     import ctypes
@@ -182,11 +208,13 @@ def choisir_fichier_natif(titre: str = "Choisir l'enregistrement") -> Optional[s
             ("FlagsEx", wintypes.DWORD),
         ]
 
-    filtre = "".join(f"{nom}\0{masque}\0" for nom, masque in _filtre_audio()) + "\0"
-    tampon = ctypes.create_unicode_buffer(8192)
+    filtre = "".join(f"{nom}\0{masque}\0" for nom, masque in filtres) + "\0"
+    tampon = ctypes.create_unicode_buffer(65536 if multiple else 8192)
     issue: dict[str, Any] = {}
 
     OFN = 0x0008_180C  # EXPLORER | FILEMUSTEXIST | PATHMUSTEXIST | NOCHANGEDIR | HIDEREADONLY
+    if multiple:
+        OFN |= 0x0200  # ALLOWMULTISELECT
     COINIT_APARTMENTTHREADED = 0x2
 
     def _montrer() -> None:
@@ -206,7 +234,14 @@ def choisir_fichier_natif(titre: str = "Choisir l'enregistrement") -> Optional[s
             ofn.lpstrTitle = titre
             ofn.Flags = OFN
             if ctypes.windll.comdlg32.GetOpenFileNameW(ctypes.byref(ofn)):
-                issue["chemin"] = tampon.value
+                # Sélection multiple : « dossier\0fichier1\0fichier2\0\0 » ;
+                # un seul fichier : son chemin complet.
+                brut = ctypes.wstring_at(ctypes.addressof(tampon), len(tampon))
+                parties = [x for x in brut.split("\0\0", 1)[0].split("\0") if x]
+                if len(parties) > 1:
+                    issue["chemins"] = [os.path.join(parties[0], f) for f in parties[1:]]
+                elif parties:
+                    issue["chemins"] = parties
             else:
                 code = ctypes.windll.comdlg32.CommDlgExtendedError()
                 if code:                       # 0 = simple annulation
@@ -223,7 +258,7 @@ def choisir_fichier_natif(titre: str = "Choisir l'enregistrement") -> Optional[s
         raise RuntimeError("la boîte de dialogue ne répond pas")
     if "erreur" in issue:
         raise RuntimeError(issue["erreur"])
-    return issue.get("chemin")
+    return issue.get("chemins")
 
 
 def identifier_application() -> None:
@@ -348,10 +383,177 @@ def hhmm(secondes: float) -> str:
 
 
 # ----------------------------------------------------------------------
+# Réglages mémorisés, modules installés à la demande, ouverture de fichiers
+# ----------------------------------------------------------------------
+def lire_reglages() -> dict[str, Any]:
+    try:
+        return json.loads(REGLAGES.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def ecrire_reglages(**maj: Any) -> None:
+    try:
+        r = lire_reglages()
+        r.update(maj)
+        REGLAGES.parent.mkdir(parents=True, exist_ok=True)
+        REGLAGES.write_text(json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        noter(f"réglages non enregistrés : {exc}")
+
+
+_VERROU_PIP = threading.Lock()
+_ECHECS_PIP: set[str] = set()     # une installation ratée n'est pas retentée par photo
+
+
+def module_requis(nom: str, paquet: str, signaler=None) -> Any:
+    """Importe `nom`, en installant `paquet` dans le venv s'il manque.
+    Une installation faite avant l'arrivée des supports (PPTX, photos) n'a
+    ni python-pptx ni Pillow : inutile de relancer Installer.bat pour ça."""
+    try:
+        return importlib.import_module(nom)
+    except ImportError:
+        pass
+    with _VERROU_PIP:
+        try:
+            return importlib.import_module(nom)
+        except ImportError:
+            pass
+        if paquet in _ECHECS_PIP:
+            raise ImportError(f"{paquet} indisponible (installation déjà tentée)")
+        python = Path(sys.executable)
+        if python.name.lower() == "pythonw.exe" and python.with_name("python.exe").exists():
+            python = python.with_name("python.exe")
+        if signaler:
+            signaler(f"Installation de {paquet}…")
+        noter(f"module {nom} absent : pip install {paquet}")
+        code, sortie = _lancer_utilitaire(
+            [str(python), "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
+             paquet], 900)
+        noter(f"pip install {paquet} : code {code} — {sortie.strip()[-300:]}")
+        importlib.invalidate_caches()
+        try:
+            return importlib.import_module(nom)
+        except ImportError as exc:
+            _ECHECS_PIP.add(paquet)
+            raise ImportError(f"{paquet} n'a pas pu s'installer (connexion ?) — "
+                              "relance Installer.bat") from exc
+
+
+def ouvrir_fichier(chemin: Path, *, modifier: bool = False) -> None:
+    """Ouvre un fichier ou un dossier avec l'application de Windows. Pour
+    modifier un .md sans application associée, le Bloc-notes prend le relais."""
+    if os.name != "nt":
+        subprocess.Popen(["xdg-open", str(chemin)])
+        return
+    for verbe in (("edit", "open") if modifier else ("open",)):
+        try:
+            os.startfile(str(chemin), verbe)  # noqa: S606
+            return
+        except OSError:
+            continue
+    if modifier:
+        subprocess.Popen(["notepad.exe", str(chemin)])
+    else:
+        subprocess.Popen(["explorer", str(chemin)], creationflags=NO_WINDOW)
+
+
+# ----------------------------------------------------------------------
+# Consignes de synthèse : un fichier .md par modèle
+# ----------------------------------------------------------------------
+def installer_modeles() -> None:
+    """Copie dans Documents\\Transcriptor\\Consignes les modèles livrés avec
+    l'application qui n'y ont jamais été proposés. Un modèle que l'utilisateur
+    a supprimé ne revient pas, sauf si le dossier est vide : les noms déjà
+    livrés sont notés dans .modeles_livres."""
+    CONSIGNES.mkdir(parents=True, exist_ok=True)
+    registre = CONSIGNES / ".modeles_livres"
+    try:
+        livres = set(registre.read_text(encoding="utf-8").split("\n")) - {""}
+    except OSError:
+        livres = set()
+    vide = not any(_modele_visible(p) for p in CONSIGNES.glob("*.md"))
+    modeles = sorted(MODELES_APP.glob("*.md")) if MODELES_APP.is_dir() else []
+    change = False
+    for src in modeles:
+        cible = CONSIGNES / src.name
+        if not cible.exists() and (vide or src.name not in livres):
+            shutil.copyfile(src, cible)
+            noter(f"consignes : modèle « {src.stem} » installé")
+            change = True
+        if src.name not in livres:
+            livres.add(src.name)
+            change = True
+    if change:
+        registre.write_text("\n".join(sorted(livres)) + "\n", encoding="utf-8")
+
+
+def _modele_visible(p: Path) -> bool:
+    return p.suffix.lower() == ".md" and not p.name.startswith((".", "~", "_"))
+
+
+def liste_consignes() -> list[dict[str, Any]]:
+    try:
+        installer_modeles()
+    except Exception as exc:  # noqa: BLE001
+        noter(f"consignes : installation des modèles impossible ({exc})")
+    modeles = []
+    for p in sorted((x for x in CONSIGNES.glob("*.md") if _modele_visible(x)),
+                    key=lambda x: x.stem.lower()):
+        info: dict[str, Any] = {"nom": p.stem, "description": "", "avertissement": "",
+                                "sections": 0}
+        try:
+            c = entete.lire(p)
+            info["description"] = c.description
+            info["sections"] = len(Jalons.depuis(c.corps).noms)
+            if not c.corps.strip():
+                info["avertissement"] = "Fichier vide : Claude n'aurait aucune consigne."
+            elif c.avertissements:
+                info["avertissement"] = " ; ".join(c.avertissements)
+        except Exception as exc:  # noqa: BLE001
+            info["avertissement"] = f"Illisible : {exc}"
+        modeles.append(info)
+    return modeles
+
+
+def chemin_consignes(nom: str) -> Path:
+    """Le fichier du modèle `nom`, sans jamais sortir du dossier Consignes."""
+    p = (CONSIGNES / f"{nom}.md").resolve()
+    if not nom or p.parent != CONSIGNES.resolve() or not p.is_file():
+        raise FileNotFoundError(f"Modèle de consignes introuvable : « {nom} ».")
+    return p
+
+
+def debut_enregistrement(audio: Path) -> Optional[datetime.datetime]:
+    """Heure de début de l'enregistrement quand le fichier la porte
+    (métadonnée creation_time), en heure locale. Sert à situer les photos
+    du tableau dans le cours."""
+    try:
+        import av
+
+        with av.open(str(audio)) as conteneur:
+            brut = conteneur.metadata.get("creation_time") or next(
+                (f.metadata.get("creation_time") for f in conteneur.streams
+                 if f.metadata.get("creation_time")), None)
+        if not brut:
+            return None
+        d = datetime.datetime.fromisoformat(brut.strip().replace("Z", "+00:00"))
+        if d.tzinfo:
+            d = d.astimezone().replace(tzinfo=None)
+        return d if d.year >= 2000 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ----------------------------------------------------------------------
 # État du traitement
 # ----------------------------------------------------------------------
+_NUMEROS = iter(range(1, 1_000_000))
+
+
 class Traitement:
     def __init__(self, audio: Path, dossier: Path, options: dict[str, Any], notifier):
+        self.id = next(_NUMEROS)
         self.audio = audio
         self.dossier = dossier
         self.options = options
@@ -361,13 +563,22 @@ class Traitement:
         self.usage: dict[str, Any] = {}
         self.fichiers: dict[str, str] = {}
         self.etapes = {n: {"statut": "attente", "avancement": 0.0, "detail": ""} for n in STEPS}
+        self.etapes["supports"]["statut"] = "ignore"
         self._dernier_envoi = 0.0
+        self.consignes: Optional[Path] = None          # modèle choisi (fichier vivant)
+        self.sources_supports = [Path(p) for p in options.get("supports") or []]
+        self.supports: list[sup.Support] = []
+        self.avertissements: list[str] = []
+        self.debut: Optional[datetime.datetime] = None  # début de l'enregistrement
+        self.duree = 0.0                                # durée de l'audio, en s
 
     def instantane(self) -> dict[str, Any]:
         return {
             "etat": self.etat, "erreur": self.erreur, "usage": self.usage,
             "etapes": self.etapes, "fichiers": self.fichiers,
             "nom": self.audio.stem, "dossier": str(self.dossier),
+            "consignes": self.consignes.stem if self.consignes else "",
+            "avertissements": self.avertissements, "id": self.id,
         }
 
     def maj(self, etape: str, *, statut: str | None = None,
@@ -396,15 +607,71 @@ class Traitement:
 
 
 # ----------------------------------------------------------------------
+# Étape 0 — supports du cours (diapos, photos du tableau, notes)
+# ----------------------------------------------------------------------
+def preparer_supports(t: Traitement) -> None:
+    """Prépare les supports joints dans <cours>/supports/. Ceux d'un passage
+    précédent (relance, reprise) sont repris sans être refaits."""
+    dossier = t.dossier / "supports"
+    deja = sup.lire_manifeste(dossier) if dossier.is_dir() else []
+    if not t.sources_supports and not deja:
+        t.maj("supports", statut="ignore", detail="aucun")
+        return
+
+    nouveaux = [p for p in t.sources_supports
+                if str(p.resolve()) not in {s.source for s in deja}]
+    total = max(1, len(nouveaux))
+    compte = [0]
+    t.maj("supports", statut="en_cours", avancement=0.0,
+          detail=f"Préparation de {total} fichier" + ("s" if total > 1 else "") if nouveaux
+          else "Reprise des supports déjà préparés")
+
+    def fichier(nom: str) -> None:
+        compte[0] += 1
+        t.maj("supports", avancement=(compte[0] - 1) / total,
+              detail=f"{compte[0]}/{total} · {nom}"[:90])
+
+    def importer(nom: str, paquet: str) -> Any:
+        return module_requis(nom, paquet, lambda m: t.maj("supports", detail=m))
+
+    t.supports, avert = sup.preparer(t.sources_supports, dossier,
+                                     importer=importer, signaler=fichier)
+    for a in avert:
+        noter("supports : " + a)
+        if a not in t.avertissements:
+            t.avertissements.append(a)
+    if not t.supports:
+        t.maj("supports", statut="ignore", detail="aucun support utilisable")
+        return
+    detail = sup.resume(t.supports)
+    if avert:
+        detail += f" · {len(avert)} ignoré" + ("s" if len(avert) > 1 else "")
+    t.maj("supports", statut="fait", avancement=1.0, detail=detail)
+    noter(f"supports : {detail}")
+
+
+# ----------------------------------------------------------------------
 # Étape 1 — transcription
 # ----------------------------------------------------------------------
 def amorce(matiere: str, termes: str) -> str:
+    """Amorce de Whisper (initial_prompt). Avec condition_on_previous_text
+    à False, faster-whisper ne la donne qu'à la première fenêtre de 30 s :
+    le vocabulaire passe donc aussi par mots_cles()."""
     matiere = matiere.strip() or "cours magistral"
     texte = f"Cours magistral de {matiere}."
     termes = termes.strip().strip(",")
     if termes:
         texte += f" Vocabulaire : {termes}."
     return texte[:900]  # Whisper tronque au-delà d'environ 224 tokens.
+
+
+def mots_cles(termes: str, diapos: str = "") -> str:
+    """Vocabulaire redonné à Whisper à chaque fenêtre (hotwords) : il y
+    reprend l'orthographe et la casse. Les termes saisis d'abord — faster-
+    whisper coupe par la fin au-delà de ~220 tokens —, puis les titres des
+    diapositives jointes."""
+    morceaux = [x.strip().strip(",") for x in (termes, diapos) if x and x.strip().strip(",")]
+    return ", ".join(morceaux)[:900]
 
 
 def charger_modele(nom: str, *, cpu: bool = False):
@@ -449,16 +716,24 @@ def _transcrire(t: Traitement, *, cpu: bool) -> Path:
     modele = charger_modele(t.options["modele"], cpu=cpu)
 
     t.maj("transcription", detail="Analyse de l'audio")
-    segments, info = modele.transcribe(
-        str(t.audio),
+    reglages = dict(
         language="fr",
         beam_size=5,
         vad_filter=True,
         condition_on_previous_text=False,
         initial_prompt=amorce(t.options["matiere"], t.options["termes"]),
     )
+    vocabulaire = mots_cles(t.options["termes"],
+                            sup.vocabulaire(t.supports, t.dossier / "supports"))
+    try:
+        segments, info = modele.transcribe(str(t.audio), hotwords=vocabulaire or None,
+                                           **reglages)
+    except TypeError:            # faster-whisper < 1.0.2 : pas de hotwords
+        segments, info = modele.transcribe(str(t.audio), **reglages)
 
     total = max(float(info.duration or 0.0), 1.0)
+    t.duree = total
+    t.debut = debut_enregistrement(t.audio)
     sortie = t.dossier / "transcription.txt"
     depart = time.time()
     minute_courante = -1
@@ -466,7 +741,10 @@ def _transcrire(t: Traitement, *, cpu: bool) -> Path:
 
     with sortie.open("w", encoding="utf-8") as fh:
         fh.write(f"Cours : {t.options['matiere'] or 'à préciser'}\n")
-        fh.write(f"Fichier : {t.audio.name}\nDurée : {hhmm(total)}\n\n")
+        fh.write(f"Fichier : {t.audio.name}\nDurée : {hhmm(total)}\n")
+        if t.debut:
+            fh.write(f"Début : {t.debut:%Y-%m-%d %H:%M:%S}\n")
+        fh.write("\n")
 
         for seg in segments:
             minute = int(seg.start // 60)
@@ -499,13 +777,29 @@ def _transcrire(t: Traitement, *, cpu: bool) -> Path:
 # ----------------------------------------------------------------------
 # Étape 2 — synthèse par Claude Code
 # ----------------------------------------------------------------------
-CONSIGNE = (
-    "La transcription brute d'un cours t'est transmise sur l'entrée standard. "
-    "Produis le support de révision complet en suivant strictement les instructions "
-    "de CLAUDE.md. Traite la transcription en entier, en une seule réponse : "
-    "personne ne pourra te dire de continuer. Réponds uniquement par le Markdown "
-    "final, sans préambule ni commentaire, en commençant directement par la section 1."
-)
+def consigne(avec_supports: bool) -> str:
+    """Le prompt passé à `claude -p`. Tout le reste (consignes choisies,
+    supports, transcription) arrive sur l'entrée standard.
+
+    Pas de chevrons ni de guillemets droits ici : claude.cmd passe par
+    cmd.exe, qui les interpréterait hors d'une chaîne protégée."""
+    texte = ("L'entrée standard contient, entre balises : consignes, les règles de "
+             "rédaction à appliquer ; transcription, la transcription brute d'un cours")
+    if avec_supports:
+        texte += (" ; supports, les supports de ce cours (diapositives, photos du tableau, "
+                  "notes). Avant de rédiger, lis avec l'outil Read chaque image et chaque PDF "
+                  "listés, puis croise-les avec la transcription comme le demandent les "
+                  "consignes — à défaut : corrige grâce à eux les termes, noms, chiffres et "
+                  "formules mal transcrits, complète schémas et formules, et cite la source "
+                  "(diapo n, photo n). Pour insérer une image dans le document, écris "
+                  "![légende](supports/nom_du_fichier.jpg) avec un nom exact de la liste")
+    texte += (". Produis le document décrit par les consignes, en suivant strictement leur "
+              "structure, leur ordre et leur style. Traite tout en une seule réponse : "
+              "personne ne pourra te dire de continuer, ignore donc ce que les consignes "
+              "prévoient pour un échange (commandes rapides, traitement en plusieurs fois). "
+              "Réponds uniquement par le Markdown final, sans préambule ni commentaire.")
+    return texte
+
 
 # Garde-fous de l'appel à Claude. L'ancien couperet fixe (30 min) tombait en
 # pleine rédaction d'un cours long — et ne tuait que claude.cmd, pas node.
@@ -514,15 +808,9 @@ DUREE_MAX = 120 * 60       # plafond absolu, quoi qu'il arrive
 JOURNAL_SYNTHESE = "synthese.log"      # dans le dossier du cours
 PARTIEL_SYNTHESE = "synthese_partielle.md"
 
-# Sections de sortie attendues. Elles ne sont pas figées ici : elles sont
-# relues dans CLAUDE.md à chaque lancement, pour que modifier CLAUDE.md
-# suffise à changer la sortie sans toucher au code.
-SECTIONS_DEFAUT = {
-    1: "En-tête", 2: "Résumé exécutif", 3: "Plan du cours",
-    4: "Points clés", 5: "Fiches de révision", 6: "Signaux examen",
-    7: "Informations pratiques", 8: "Lexique", 9: "Auto-évaluation",
-    10: "Zones d'ombre",
-}
+# Les sections attendues ne sont pas figées ici : elles sont relues dans le
+# fichier de consignes choisi (titres « ### 1. Nom »), pour que modifier les
+# consignes suffise à changer la sortie — et le suivi d'avancement.
 
 _RE_TITRE = re.compile(r"^#{1,4}[ \t]*(.+?)[ \t]*$", re.M)
 _RE_NUMERO = re.compile(r"^(\d{1,2})[.)]")
@@ -535,32 +823,29 @@ def _sans_accent(texte: str) -> str:
 
 
 class Jalons:
-    """Les titres de sections de CLAUDE.md, servant de repères d'avancement
-    pendant que Claude rédige."""
+    """Les titres de sections numérotées des consignes (« ### 3. Plan »),
+    servant de repères d'avancement pendant que Claude rédige. Des consignes
+    sans sections numérotées n'en ont pas : on affiche alors le nombre de
+    mots écrits."""
 
     def __init__(self, sections: dict[int, str]):
-        self.noms = sections or dict(SECTIONS_DEFAUT)
-        self.total = max(self.noms)
+        self.noms = sections
+        self.total = max(sections) if sections else 0
         self._plats = {n: _sans_accent(v) for n, v in self.noms.items()}
 
     @classmethod
-    def depuis(cls, *candidats: Path) -> "Jalons":
-        for chemin in candidats:
-            try:
-                texte = chemin.read_text(encoding="utf-8")
-            except Exception:
-                continue
-            trouve: dict[int, str] = {}
-            for m in _RE_SECTION_CONSIGNE.finditer(texte):
-                n = int(m.group(1))
-                if 1 <= n <= 40:
-                    trouve.setdefault(n, m.group(2))
-            if len(trouve) >= 3:
-                return cls(trouve)
-        return cls(dict(SECTIONS_DEFAUT))
+    def depuis(cls, texte: str) -> "Jalons":
+        trouve: dict[int, str] = {}
+        for m in _RE_SECTION_CONSIGNE.finditer(texte or ""):
+            n = int(m.group(1))
+            if 1 <= n <= 40:
+                trouve.setdefault(n, m.group(2))
+        return cls(trouve if len(trouve) >= 3 else {})
 
     def reperer(self, texte: str) -> int:
         """Numéro de la section la plus avancée présente dans un fragment."""
+        if not self.total:
+            return 0
         vu = 0
         for titre in _RE_TITRE.findall(texte):
             m = _RE_NUMERO.match(titre)
@@ -765,7 +1050,7 @@ def _expliquer(message: str, code: Optional[int]) -> str:
     return message
 
 
-def _appeler_claude(t: Traitement, commande: list[str], transcription: Path,
+def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
                     jalons: Jalons) -> tuple[str, dict[str, Any]]:
     debut = time.time()
     journal = t.dossier / JOURNAL_SYNTHESE
@@ -781,12 +1066,13 @@ def _appeler_claude(t: Traitement, commande: list[str], transcription: Path,
 
     tracer("", f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} === "
               + subprocess.list2cmdline(commande[:2] + ["<consigne>"] + commande[3:]),
-           f"stdin : {transcription} ({transcription.stat().st_size} octets)")
+           f"consignes : {t.consignes} · supports : {len(t.supports)} fichier(s)",
+           f"stdin : {entree} ({entree.stat().st_size} octets)")
 
-    with transcription.open("rb") as stdin:
+    with entree.open("rb") as stdin:
         proc = suivre(subprocess.Popen(
             commande, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=t.dossier, creationflags=NO_WINDOW, shell=False,
+            cwd=entree.parent, creationflags=NO_WINDOW, shell=False,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         ))
 
@@ -834,6 +1120,7 @@ def _appeler_claude(t: Traitement, commande: list[str], transcription: Path,
     nb_deltas = 0
     partiel = ""
     section = 0
+    mots = 0
 
     try:
         for ligne in proc.stdout:  # type: ignore[union-attr]
@@ -860,6 +1147,13 @@ def _appeler_claude(t: Traitement, commande: list[str], transcription: Path,
                 tracer(ligne)
             if genre == "result":
                 resultat = ev
+            if genre == "assistant":
+                # Claude lit les supports avant de rédiger : on le montre.
+                for b in (ev.get("message") or {}).get("content") or []:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        cible = str((b.get("input") or {}).get("file_path") or "")
+                        t.maj("synthese", detail="Lecture des supports · "
+                              + (Path(cible).name or str(b.get("name") or "")))
 
             morceau = _fragment(ev)
             if not morceau:
@@ -872,11 +1166,19 @@ def _appeler_claude(t: Traitement, commande: list[str], transcription: Path,
             if "\n" in partiel:
                 complet, _, partiel = partiel.rpartition("\n")
                 section = max(section, jalons.reperer(complet))
+                if genre != "assistant" or not nb_deltas:   # sans double compte
+                    mots += len(complet.split())
             ecoule = int(time.time() - debut)
-            t.maj("synthese",
-                  avancement=section / jalons.total,
-                  detail=(jalons.etiquette(section) if section
-                          else f"Rédaction… {ecoule} s"))
+            if jalons.total:
+                t.maj("synthese",
+                      avancement=section / jalons.total,
+                      detail=(jalons.etiquette(section) if section
+                              else f"Rédaction… {ecoule} s"))
+            else:
+                t.maj("synthese",
+                      avancement=mots / (mots + 4000) if mots else 0.04,
+                      detail=(f"Rédaction… {mots} mots · {ecoule} s" if mots
+                              else f"Rédaction… {ecoule} s"))
     finally:
         proc.wait()
         drain.join(5)
@@ -946,6 +1248,42 @@ def _appeler_claude(t: Traitement, commande: list[str], transcription: Path,
     raise RuntimeError(message[:400])
 
 
+def preparer_atelier(t: Traitement, corps: str, transcription: Path) -> Path:
+    """Crée le répertoire de travail de cette synthèse (supports du cours) et
+    y écrit ce que Claude recevra sur l'entrée standard : consignes,
+    supports, transcription. Renvoie ce fichier ; son dossier est le cwd.
+    Les ateliers de plus d'un jour sont effacés au passage : le dernier reste
+    disponible pour diagnostic."""
+    ATELIER.mkdir(parents=True, exist_ok=True)
+    for vieux in ATELIER.glob("cours-*"):
+        try:
+            if time.time() - vieux.stat().st_mtime > 24 * 3600:
+                shutil.rmtree(vieux, ignore_errors=True)
+        except OSError:
+            pass
+    atelier = Path(tempfile.mkdtemp(prefix=f"cours-{time.strftime('%Y%m%d-%H%M%S')}-",
+                                    dir=ATELIER))
+    copie = atelier / "supports"
+    if t.supports:
+        copie.mkdir(parents=True, exist_ok=True)
+        for s in t.supports:
+            try:
+                shutil.copyfile(t.dossier / "supports" / s.fichier, copie / s.fichier)
+            except OSError as exc:
+                noter(f"support {s.fichier} non copié : {exc}")
+
+    bloc = sup.bloc_pour_claude(t.supports, t.dossier / "supports",
+                                debut=t.debut, duree=t.duree, racine=copie)
+    texte = transcription.read_text(encoding="utf-8", errors="replace").strip()
+    entree = atelier / "entree_claude.txt"
+    entree.write_text(
+        "<consignes>\n" + corps.strip() + "\n</consignes>\n\n"
+        + (bloc + "\n\n" if bloc else "")
+        + "<transcription>\n" + texte + "\n</transcription>\n",
+        encoding="utf-8")
+    return entree
+
+
 def synthetiser(t: Traitement, transcription: Path) -> Path:
     claude = chemin_claude()
     if not claude:
@@ -961,13 +1299,31 @@ def synthetiser(t: Traitement, transcription: Path) -> Path:
 
     t.maj("synthese", statut="en_cours", detail="Claude lit la transcription")
 
-    # La copie posée dans le dossier du cours fait foi ; le fichier de
-    # l'application sert de secours.
-    jalons = Jalons.depuis(t.dossier / "CLAUDE.md", CLAUDE_MD)
+    # Les consignes sont relues à chaque synthèse : une modification du
+    # fichier s'applique au cours suivant, ou à « Relancer la synthèse ».
+    if not t.consignes or not t.consignes.is_file():
+        raise RuntimeError("Le fichier de consignes a disparu. Choisis un modèle dans la "
+                           "liste « Consignes de synthèse » et relance.")
+    regles = entete.lire(t.consignes)
+    if not regles.corps.strip():
+        raise RuntimeError(f"Le fichier de consignes « {t.consignes.stem} » est vide.")
+    try:  # trace : quelles consignes ont produit ce support
+        shutil.copyfile(t.consignes, t.dossier / "consignes.md")
+    except OSError as exc:
+        noter(f"copie des consignes impossible : {exc}")
+    jalons = Jalons.depuis(regles.corps)
+    entree = preparer_atelier(t, regles.corps, transcription)
 
-    # 12 tours : Claude n'a besoin que d'un seul, mais s'il décide de relire
-    # CLAUDE.md ou la transcription par morceaux, 6 ne suffisaient plus.
-    base = [claude, "-p", CONSIGNE, "--max-turns", "12"]
+    # 12 tours suffisent à rédiger ; chaque image ou tranche de PDF à lire
+    # en demande un de plus.
+    lectures = 0
+    for s in sup.a_lire(t.supports):
+        pages = re.search(r"\d+", s.detail) if s.genre == "pdf" else None
+        lectures += 1 + (int(pages.group(0)) // 15 if pages else 0)
+    base = [claude, "-p", consigne(bool(t.supports)),
+            "--max-turns", str(min(80, 12 + lectures))]
+    if lectures:
+        base += ["--allowedTools", "Read"]
     # Du plus bavard au plus sobre : chaque repli perd un peu d'avancement
     # mais reste fonctionnel sur une version plus ancienne du CLI.
     tentatives = [
@@ -981,7 +1337,7 @@ def synthetiser(t: Traitement, transcription: Path) -> Path:
         derniere: Optional[Exception] = None
         for commande in tentatives:
             try:
-                return _appeler_claude(t, commande, transcription, jalons)
+                return _appeler_claude(t, commande, entree, jalons)
             except _OptionInconnue as exc:
                 derniere = exc
         raise RuntimeError(str(derniere)[:400] if derniere else
@@ -1031,9 +1387,12 @@ def mettre_en_page(t: Traitement, markdown: Path) -> None:
         t.maj("pdf", statut="ignore", detail="Script de mise en page absent")
         return
 
-    t.maj("pdf", statut="en_cours", detail="Rendu en cours")
+    t.maj("pdf", statut="en_cours", avancement=0.0, detail="Rendu en cours")
+    commande = [sys.executable, str(PDF_SCRIPT), str(markdown)]
+    if t.consignes and t.consignes.is_file():
+        commande += ["--consignes", str(t.consignes)]   # l'en-tête `pdf:` règle la page
     proc = suivre(subprocess.Popen(
-        [sys.executable, str(PDF_SCRIPT), str(markdown)],
+        commande,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NO_WINDOW,
     ))
     try:
@@ -1049,7 +1408,13 @@ def mettre_en_page(t: Traitement, markdown: Path) -> None:
         return
 
     t.fichiers["pdf"] = str(pdf)
-    t.maj("pdf", statut="fait", avancement=1.0, detail=f"{pdf.stat().st_size / 1024:.0f} Ko")
+    remarques = [l.strip() for l in (err or b"").decode("utf-8", "replace").splitlines()
+                 if l.strip().startswith("Consignes")]
+    for r in remarques:
+        if r not in t.avertissements:
+            t.avertissements.append(r)
+    t.maj("pdf", statut="fait", avancement=1.0, detail=f"{pdf.stat().st_size / 1024:.0f} Ko"
+          + (" · réglages à vérifier" if remarques else ""))
 
 
 # ----------------------------------------------------------------------
@@ -1074,23 +1439,105 @@ class Passerelle:
     # -- appelée depuis le JavaScript ---------------------------------
     def choisir_fichier(self) -> Optional[dict[str, Any]]:
         noter("appel choisir_fichier")
+        chemins = self._dialogue("Choisir l'enregistrement", _filtres_principal(), False)
+        return self._decrire(chemins[0]) if chemins else None
+
+    def choisir_supports(self) -> list[dict[str, Any]]:
+        """Diapos, photos du tableau, notes : plusieurs fichiers à la fois."""
+        noter("appel choisir_supports")
+        chemins = self._dialogue("Ajouter des supports du cours", _filtres_supports(), True)
+        return [self._decrire_support(c) for c in chemins or []]
+
+    def _dialogue(self, titre: str, filtres: list[tuple[str, str]],
+                  multiple: bool) -> Optional[list[str]]:
         if os.name == "nt":
             try:
-                chemin = choisir_fichier_natif()
-                noter(f"boîte native : {chemin or 'annulée'}")
-                return self._decrire(chemin) if chemin else None
+                chemins = choisir_fichier_natif(titre, filtres, multiple)
+                noter(f"boîte native : {len(chemins) if chemins else 'annulée'}")
+                return chemins
             except Exception as exc:  # noqa: BLE001
                 noter(f"boîte native indisponible ({exc}), repli sur pywebview")
 
         import webview
 
-        motifs = ("Fichiers audio (" + ";".join(f"*{e}" for e in AUDIO_EXT) + ")",
-                  "Tous les fichiers (*.*)")
+        # pywebview n'accepte que lettres et espaces dans le nom d'un filtre.
+        motifs = tuple(" ".join(re.sub(r"[^\w ]+", " ", nom).split()) + f" ({masque})"
+                       for nom, masque in filtres)
         resultat = self._fenetre.create_file_dialog(
-            webview.OPEN_DIALOG, allow_multiple=False, file_types=motifs)
-        if not resultat:
-            return None
-        return self._decrire(resultat[0])
+            webview.OPEN_DIALOG, allow_multiple=multiple, file_types=motifs)
+        return list(resultat) if resultat else None
+
+    def _decrire_support(self, chemin: str) -> dict[str, Any]:
+        p = Path(chemin)
+        genre = sup.genre_de(p)
+        info: dict[str, Any] = {"chemin": str(p), "nom": p.name, "genre": genre}
+        if not p.is_file():
+            info["erreur"] = "introuvable"
+        elif not genre:
+            info["erreur"] = f"format {p.suffix or 'inconnu'} non pris en charge"
+        elif genre == "ppt":
+            info["erreur"] = "ancien format .ppt : enregistre-le en .pptx ou en PDF"
+        else:
+            taille = p.stat().st_size
+            info["taille"] = (f"{taille / 1048576:.1f} Mo" if taille >= 1048576
+                              else f"{max(1, round(taille / 1024))} Ko")
+        return info
+
+    # -- consignes -----------------------------------------------------
+    def lister_consignes(self) -> dict[str, Any]:
+        modeles = liste_consignes()
+        noms = [m["nom"] for m in modeles]
+        choisi = lire_reglages().get("consignes")
+        if choisi not in noms:
+            choisi = "Cours complet" if "Cours complet" in noms else (noms[0] if noms else "")
+        return {"modeles": modeles, "choisi": choisi, "dossier": str(CONSIGNES)}
+
+    def retenir_consignes(self, nom: str) -> bool:
+        ecrire_reglages(consignes=nom)
+        return True
+
+    def modifier_consignes(self, nom: str) -> dict[str, Any]:
+        try:
+            ouvrir_fichier(chemin_consignes(nom), modifier=True)
+            return {}
+        except Exception as exc:  # noqa: BLE001
+            return {"erreur": str(exc)}
+
+    def dupliquer_consignes(self, nom: str, nouveau: str) -> dict[str, Any]:
+        """Copie un modèle sous un autre nom et l'ouvre pour modification."""
+        try:
+            source = chemin_consignes(nom)
+        except FileNotFoundError as exc:
+            return {"erreur": str(exc)}
+        propre = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", nouveau or "").strip().strip(".")[:80]
+        if not propre:
+            return {"erreur": "Donne un nom au nouveau modèle."}
+        cible = CONSIGNES / f"{propre}.md"
+        if cible.exists():
+            return {"erreur": f"Un modèle « {propre} » existe déjà."}
+        try:
+            shutil.copyfile(source, cible)
+        except OSError as exc:
+            return {"erreur": f"Copie impossible : {exc}"}
+        noter(f"consignes : « {nom} » dupliqué en « {propre} »")
+        ecrire_reglages(consignes=propre)
+        ouvrir_fichier(cible, modifier=True)
+        return {"nom": propre}
+
+    def ouvrir_dossier_consignes(self) -> None:
+        try:
+            installer_modeles()
+        except Exception:  # noqa: BLE001
+            CONSIGNES.mkdir(parents=True, exist_ok=True)
+        ouvrir_fichier(CONSIGNES)
+
+    def modifier_consignes_du_cours(self) -> dict[str, Any]:
+        """Depuis l'écran de résultat : le modèle utilisé pour ce cours."""
+        t = self._courant
+        if not t or not t.consignes:
+            return {"erreur": "Aucun modèle associé à ce cours."}
+        ouvrir_fichier(t.consignes, modifier=True)
+        return {}
 
     def etat_claude(self) -> dict[str, str]:
         """Où en est la vérification de Claude Code lancée au démarrage."""
@@ -1107,6 +1554,19 @@ class Passerelle:
         p = Path(chemin)
         if not p.is_file():
             return {"erreur": "Fichier introuvable."}
+        if p.suffix.lower() == ".md":
+            # Un support déjà rédigé : on ne refera que la mise en page, selon
+            # l'en-tête `pdf:` des consignes choisies.
+            try:
+                mots = len(p.read_text(encoding="utf-8", errors="replace").split())
+            except OSError:
+                mots = 0
+            if not mots:
+                return {"erreur": "Ce fichier Markdown est vide."}
+            return {"chemin": str(p), "nom": p.name, "pdf_seul": True, "mots": mots}
+        if p.suffix.lower() in sup.EXT_SUPPORTS and p.suffix.lower() not in (".txt",):
+            return {"erreur": "C'est un support (diapos, photo) : ajoute-le avec « Ajouter des "
+                              "supports ». Ici, choisis l'enregistrement audio."}
         if p.suffix.lower() == ".txt":
             # Une transcription déjà produite : on ne refera que la synthèse.
             entete = _entete_transcription(p)
@@ -1124,19 +1584,29 @@ class Passerelle:
                 "taille": round(p.stat().st_size / 1048576)}
 
     def lancer(self, options: dict[str, Any]) -> dict[str, Any]:
-        noter(f"appel lancer : {options.get('chemin')!r}, "
-              f"modèle {options.get('modele')!r}")
+        noter(f"appel lancer : {options.get('chemin')!r}, modèle {options.get('modele')!r}, "
+              f"consignes {options.get('consignes')!r}, "
+              f"{len(options.get('supports') or [])} support(s)")
         source = Path(options.get("chemin", ""))
         if not source.exists():
             return {"erreur": "Fichier introuvable."}
+        try:
+            consignes = chemin_consignes(options.get("consignes") or "")
+        except FileNotFoundError as exc:
+            return {"erreur": f"{exc} Choisis un modèle dans « Consignes de synthèse »."}
+        ecrire_reglages(consignes=consignes.stem)
 
+        if source.suffix.lower() == ".md":
+            return self._pdf_seul(source, options, consignes)
         if source.suffix.lower() == ".txt":
-            return self._reprendre(source, options)
+            return self._reprendre(source, options, consignes)
 
         dossier = self._nouveau_dossier(source.stem)
-        self._courant = Traitement(source, dossier, options, self._pousser)
-        threading.Thread(target=self._pipeline, args=(self._courant,), daemon=True).start()
-        return self._courant.instantane()
+        t = Traitement(source, dossier, options, self._pousser)
+        t.consignes = consignes
+        self._courant = t
+        threading.Thread(target=self._pipeline, args=(t,), daemon=True).start()
+        return t.instantane()
 
     def relancer_synthese(self) -> dict[str, Any]:
         """Après un échec de la synthèse : on repart de la transcription déjà
@@ -1151,6 +1621,7 @@ class Passerelle:
                               "depuis l'audio."}
         t.etat, t.erreur, t.usage = "en_cours", None, {}
         t.fichiers = {"txt": str(transcription)}
+        t.avertissements = []
         for nom in ("synthese", "pdf"):
             t.etapes[nom] = {"statut": "attente", "avancement": 0.0, "detail": ""}
         threading.Thread(target=self._pipeline, args=(t, transcription),
@@ -1165,11 +1636,45 @@ class Passerelle:
             dossier = dossier.with_name(f"{dossier.name.rstrip('0123456789_')}_{n}")
             n += 1
         dossier.mkdir(parents=True, exist_ok=True)
-        if CLAUDE_MD.exists():
-            shutil.copy(CLAUDE_MD, dossier / "CLAUDE.md")
         return dossier
 
-    def _reprendre(self, texte: Path, options: dict[str, Any]) -> dict[str, Any]:
+    def _pdf_seul(self, md: Path, options: dict[str, Any], consignes: Path) -> dict[str, Any]:
+        """Un .md déjà produit : mise en page seule, selon les consignes choisies."""
+        t = Traitement(md, md.parent, dict(options, supports=[]), self._pousser)
+        t.consignes = consignes
+        t.fichiers["md"] = str(md)
+        if (md.parent / "transcription.txt").exists():
+            t.fichiers["txt"] = str(md.parent / "transcription.txt")
+        for nom in ("transcription", "synthese"):
+            t.etapes[nom] = {"statut": "fait", "avancement": 1.0, "detail": "déjà faite"}
+        self._courant = t
+        threading.Thread(target=self._mise_en_page_seule, args=(t,), daemon=True).start()
+        return t.instantane()
+
+    def _mise_en_page_seule(self, t: Traitement) -> None:
+        try:
+            mettre_en_page(t, Path(t.fichiers["md"]))
+        except Exception as exc:  # noqa: BLE001
+            t.maj("pdf", statut="ignore", detail=_lisible(exc)[:150])
+        t.etat = "fini"
+        t.notifier(t.instantane())
+
+    def refaire_pdf(self) -> dict[str, Any]:
+        """Remet en page le support affiché, avec l'en-tête `pdf:` actuel du
+        modèle de consignes : pour ajuster la mise en page sans relancer Claude."""
+        t = self._courant
+        noter("appel refaire_pdf")
+        if not t or t.etat == "en_cours" or not t.fichiers.get("md"):
+            return {"erreur": "Aucun support à remettre en page."}
+        t.avertissements = [a for a in t.avertissements if not a.startswith("Consignes")]
+        try:
+            mettre_en_page(t, Path(t.fichiers["md"]))
+        except Exception as exc:  # noqa: BLE001
+            t.maj("pdf", statut="ignore", detail=_lisible(exc)[:150])
+        return t.instantane()
+
+    def _reprendre(self, texte: Path, options: dict[str, Any],
+                   consignes: Path) -> dict[str, Any]:
         """Un transcription.txt choisi à la place de l'audio : la synthèse se
         refait dans son dossier de cours s'il en vient, sinon dans un nouveau."""
         entete = _entete_transcription(texte)
@@ -1180,10 +1685,8 @@ class Passerelle:
                          and texte.parent != SORTIE
                          and texte.parent.parent == SORTIE)
         if dans_un_cours:
-            dossier = texte.parent
+            dossier = texte.parent          # ses supports éventuels sont repris
             transcription = texte
-            if CLAUDE_MD.exists() and not (dossier / "CLAUDE.md").exists():
-                shutil.copy(CLAUDE_MD, dossier / "CLAUDE.md")
         else:
             dossier = self._nouveau_dossier(texte.stem)
             transcription = dossier / "transcription.txt"
@@ -1198,7 +1701,10 @@ class Passerelle:
         options = dict(options, matiere=options.get("matiere") or entete.get("matiere", ""))
 
         t = Traitement(audio, dossier, options, self._pousser)
+        t.consignes = consignes
         t.fichiers["txt"] = str(transcription)
+        t.duree = float(entete.get("secondes") or 0)
+        t.debut = entete.get("debut")
         t.etapes["transcription"] = {"statut": "fait", "avancement": 1.0,
                                      "detail": f"reprise · {entete['mots']} mots"}
         self._courant = t
@@ -1224,7 +1730,8 @@ class Passerelle:
             subprocess.Popen(["explorer", chemin], creationflags=NO_WINDOW)
 
     def _pousser(self, instantane: dict[str, Any]) -> None:
-        if not self._fenetre:
+        # Un traitement remplacé entre-temps (« Un autre cours ») se tait.
+        if not self._fenetre or not self._courant or instantane.get("id") != self._courant.id:
             return
         charge = json.dumps(instantane, ensure_ascii=False)
         try:
@@ -1246,6 +1753,11 @@ class Passerelle:
     def _pipeline(self, t: Traitement, transcription: Optional[Path] = None) -> None:
         noter(f"pipeline : {t.audio.name} -> {t.dossier}"
               + (" (reprise depuis la transcription)" if transcription else ""))
+        try:
+            preparer_supports(t)
+        except Exception as exc:  # noqa: BLE001  (un support raté n'arrête pas le cours)
+            noter("supports : échec — " + traceback.format_exc()[-400:])
+            t.maj("supports", statut="ignore", detail=_lisible(exc)[:150])
         if transcription is None:
             try:
                 transcription = transcrire(t)
@@ -1275,13 +1787,22 @@ def _entete_transcription(chemin: Path) -> dict[str, Any]:
         texte = chemin.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return infos
-    for ligne in texte.splitlines()[:5]:
-        m = re.match(r"^(Cours|Fichier|Durée)\s*:\s*(.+?)\s*$", ligne)
+    for ligne in texte.splitlines()[:6]:
+        m = re.match(r"^(Cours|Fichier|Durée|Début)\s*:\s*(.+?)\s*$", ligne)
         if m:
-            cle = {"Cours": "matiere", "Fichier": "fichier", "Durée": "duree"}[m.group(1)]
+            cle = {"Cours": "matiere", "Fichier": "fichier", "Durée": "duree",
+                   "Début": "debut"}[m.group(1)]
             infos[cle] = m.group(2)
     if infos.get("matiere") in ("à préciser", ""):
         infos["matiere"] = ""
+    m = re.fullmatch(r"(\d+):(\d{2})", infos.get("duree", ""))
+    if m:
+        infos["secondes"] = int(m.group(1)) * 3600 + int(m.group(2)) * 60
+    try:
+        infos["debut"] = (datetime.datetime.strptime(infos["debut"], "%Y-%m-%d %H:%M:%S")
+                          if infos.get("debut") else None)
+    except ValueError:
+        infos["debut"] = None
     infos["mots"] = len(texte.split())
     return infos
 
@@ -1309,6 +1830,10 @@ def main() -> None:
     identifier_application()
     enregistrer_dll_cuda()
     SORTIE.mkdir(parents=True, exist_ok=True)
+    try:
+        installer_modeles()
+    except Exception as exc:  # noqa: BLE001
+        noter(f"consignes : installation des modèles impossible ({exc})")
     preparer_webview2()
 
     import webview
