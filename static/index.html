@@ -178,6 +178,13 @@ ul.remarques{margin:12px 0 0;padding:10px 14px 10px 30px;background:#FBFCF6;
   border-left:3px solid var(--hi-yellow);font-size:13px}
 ul.remarques:empty{display:none}
 ol.steps li[data-cache="1"]{display:none}
+.pleine{grid-column:1/-1}
+.fields .hint.pleine{margin-top:-7px}
+#claude-autre{margin-top:6px}
+#claude-autre[hidden]{display:none}
+.relance{margin-top:14px}
+.relance select{width:auto;flex:0 1 auto;font-size:13px;padding:6px 8px}
+.relance .etiquette{font-size:13px;color:var(--ink-2)}
 .md .img-ph{font-family:var(--mono);font-size:12px;color:var(--ink-2)}
 
 @media (max-width:600px){
@@ -249,6 +256,20 @@ ol.steps li[data-cache="1"]{display:none}
         <p class="hint" id="c-description"></p>
         <p class="avert" id="c-avert"></p>
       </div>
+      <div class="field">
+        <label for="claude-modele">Modèle Claude <span class="facultatif">synthèse</span></label>
+        <select id="claude-modele"><option value="">Par défaut du compte</option></select>
+        <input id="claude-autre" placeholder="Identifiant : claude-opus-5-5, opus[1m]…"
+               autocomplete="off" spellcheck="false" hidden>
+      </div>
+      <div class="field">
+        <label for="claude-effort">Effort de Claude</label>
+        <select id="claude-effort"><option value="">Par défaut</option></select>
+      </div>
+      <p class="hint pleine">Les noms courts (Opus, Sonnet…) suivent d'eux-mêmes les nouvelles
+        versions. Un modèle plus puissant ou un effort plus élevé rédige plus finement, mais
+        prend plus de temps et use plus vite ta limite d'utilisation : si elle est atteinte,
+        relance la synthèse avec un autre modèle.</p>
       <div class="field wide">
         <label for="termes">Vocabulaire du chapitre</label>
         <textarea id="termes" placeholder="ArrayList&lt;String&gt;, HashMap, try/catch, throws Exception, System.out.println, polymorphisme"></textarea>
@@ -317,11 +338,13 @@ const $ = (s) => document.querySelector(s);
 let api = null, choisi = null, cache = {md:"", txt:""};
 let supports = [];                 // [{chemin, nom, genre, taille, erreur?}]
 let idCourant = null;              // traitement affiché : les autres sont ignorés
-let modeles = [];                  // [{nom, description, avertissement, sections}]
+let modeles = [];                  // [{nom, description, avertissement, sections, claude}]
+let claudeOpts = {modeles: [], efforts: [], choisi: {modele: "", effort: ""}};
 
 window.addEventListener("pywebviewready", async () => {
   api = window.pywebview.api;
   suivreClaude();
+  chargerOptionsClaude();
   chargerConsignes();
   try {
     const initial = await api.fichier_initial();
@@ -383,6 +406,9 @@ function decrireConsignes() {
   const parties = [];
   if (m && m.description) parties.push(m.description);
   if (m && m.sections) parties.push(`${m.sections} sections numérotées`);
+  if (m && m.claude && (m.claude.modele || m.claude.effort))
+    parties.push("Claude proposé : " + [m.claude.modele, m.claude.effort && "effort " + m.claude.effort]
+      .filter(Boolean).join(", "));
   $("#c-description").textContent = parties.join(" · ") ||
     (m ? "Pas de description — ajoute « description: » en tête du fichier." : "");
   $("#c-avert").textContent = m && m.avertissement ? "⚠ " + m.avertissement : "";
@@ -391,6 +417,10 @@ function decrireConsignes() {
 }
 $("#consignes").addEventListener("change", () => {
   decrireConsignes();
+  // Un modèle de consignes peut proposer son modèle Claude (bloc claude:).
+  const m = modeles.find(x => x.nom === $("#consignes").value);
+  if (m && m.claude && m.claude.modele) choisirModele(m.claude.modele);
+  if (m && m.claude && m.claude.effort) $("#claude-effort").value = m.claude.effort;
   if (api && $("#consignes").value) api.retenir_consignes($("#consignes").value);
 });
 window.addEventListener("focus", () => chargerConsignes());
@@ -415,6 +445,47 @@ $("#c-creer").addEventListener("click", async () => {
   $("#c-form").hidden = true;
   await chargerConsignes(r.nom);
 });
+
+/* ---------- modèle Claude de la synthèse ---------- */
+const AUTRE = "__autre";
+async function chargerOptionsClaude() {
+  try {
+    claudeOpts = await api.options_claude();
+  } catch (e) { return; }
+  $("#claude-modele").innerHTML = optionsModeles("") + `<option value="${AUTRE}">Autre identifiant…</option>`;
+  $("#claude-effort").innerHTML = optionsEfforts("");
+  choisirModele(claudeOpts.choisi.modele || "");
+  $("#claude-effort").value = claudeOpts.choisi.effort || "";
+}
+function optionsModeles(valeur) {
+  const liste = claudeOpts.modeles.slice();
+  if (valeur && !liste.some(m => m.valeur === valeur)) liste.push({valeur, libelle: valeur});
+  return liste.map(m => `<option value="${echapper(m.valeur)}"${m.valeur === valeur ? " selected" : ""}>` +
+                        `${echapper(m.libelle)}</option>`).join("");
+}
+function optionsEfforts(valeur) {
+  return claudeOpts.efforts.map(e => `<option value="${e.valeur}"${e.valeur === valeur ? " selected" : ""}>` +
+                                     `${echapper(e.libelle)}</option>`).join("");
+}
+function choisirModele(valeur) {
+  const connu = claudeOpts.modeles.some(m => m.valeur === valeur);
+  $("#claude-modele").value = connu ? valeur : AUTRE;
+  $("#claude-autre").hidden = connu;
+  if (!connu) $("#claude-autre").value = valeur;
+}
+function modeleChoisi() {
+  return $("#claude-modele").value === AUTRE ? $("#claude-autre").value.trim()
+                                             : $("#claude-modele").value;
+}
+$("#claude-modele").addEventListener("change", () => {
+  const autre = $("#claude-modele").value === AUTRE;
+  $("#claude-autre").hidden = !autre;
+  if (autre) $("#claude-autre").focus();
+});
+function decrireClaude(c) {
+  if (!c || (!c.modele && !c.effort)) return "Claude : modèle par défaut";
+  return "Claude : " + (c.modele || "modèle par défaut") + (c.effort ? `, effort ${c.effort}` : "");
+}
 
 /* ---------- supports du cours ---------- */
 const GENRES = {photo:"photo", diapos:"pptx", pdf:"pdf", notes:"notes", ppt:"ppt"};
@@ -503,6 +574,8 @@ $("#go").addEventListener("click", async () => {
     termes: $("#termes").value,
     modele: $("#modele").value,
     consignes: $("#consignes").value,
+    claude_modele: modeleChoisi(),
+    claude_effort: $("#claude-effort").value,
     supports: choisi.pdf_seul ? [] : supports.filter(f => !f.erreur).map(f => f.chemin),
   });
   if (r.erreur) { $("#erreur-choix").innerHTML = alerte(r.erreur); $("#go").disabled = false; return; }
@@ -523,7 +596,9 @@ window.majEtat = function (t) {
   // Une page rechargée (« Un autre cours ») peut encore recevoir la fin d'un
   // traitement précédent : seul celui lancé depuis cette page compte.
   if (idCourant === null || t.id !== idCourant) return;
-  $("#meta-cours").textContent = t.consignes ? `Consignes : ${t.consignes}` : "";
+  const pdfSeul = !!(t.etapes && t.etapes.synthese && t.etapes.synthese.detail === "déjà faite");
+  $("#meta-cours").textContent = [t.consignes && `Consignes : ${t.consignes}`,
+    !pdfSeul && decrireClaude(t.claude)].filter(Boolean).join(" · ");
   $("#remarques").innerHTML = (t.avertissements || [])
     .map(a => `<li>${echapper(a)}</li>`).join("");
   for (const [nom, e] of Object.entries(t.etapes)) {
@@ -546,7 +621,16 @@ window.majEtat = function (t) {
 function signalerEchec(t) {
   const enPanne = Object.entries(t.etapes).find(([, e]) => e.statut === "erreur");
   const etape = enPanne ? enPanne[0] : "";
-  let html = alerte(t.erreur || "Étape interrompue.") + `<div class="actions">`;
+  let html = alerte(t.erreur || "Étape interrompue.");
+  if (etape === "synthese") {
+    // Limite atteinte, modèle indisponible : on peut changer de modèle ici.
+    const c = t.claude || {};
+    html += `<div class="ligne relance"><span class="etiquette">Relancer avec le modèle</span>
+      <select id="r-modele">${optionsModeles(c.modele || "")}</select>
+      <span class="etiquette">effort</span>
+      <select id="r-effort">${optionsEfforts(c.effort || "")}</select></div>`;
+  }
+  html += `<div class="actions">`;
   if (etape === "synthese") {
     html += `<button class="action action--fort" id="relancer">Relancer la synthèse</button>`;
   }
@@ -558,7 +642,8 @@ function signalerEchec(t) {
   if (relancer) relancer.addEventListener("click", async () => {
     relancer.disabled = true;
     try {
-      const r = await api.relancer_synthese();
+      const r = await api.relancer_synthese({modele: $("#r-modele").value,
+                                             effort: $("#r-effort").value});
       if (r.erreur) { $("#erreur-etapes").innerHTML = alerte(r.erreur); return; }
       $("#erreur-etapes").innerHTML = "";
       window.majEtat(r);
@@ -586,7 +671,7 @@ async function terminer(t) {
   if (u.entree) {
     const sec = u.duree ? ` en ${Math.round(u.duree / 1000)} s` : "";
     $("#usage").textContent =
-      `Synthèse : ${u.entree.toLocaleString("fr-FR")} tokens lus, ` +
+      `Synthèse${u.modele ? " par " + u.modele : ""} : ${u.entree.toLocaleString("fr-FR")} tokens lus, ` +
       `${(u.sortie || 0).toLocaleString("fr-FR")} écrits${sec}.`;
   }
   $("#panel-resultat").scrollIntoView({behavior:"smooth", block:"start"});

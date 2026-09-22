@@ -501,10 +501,11 @@ def liste_consignes() -> list[dict[str, Any]]:
     for p in sorted((x for x in CONSIGNES.glob("*.md") if _modele_visible(x)),
                     key=lambda x: x.stem.lower()):
         info: dict[str, Any] = {"nom": p.stem, "description": "", "avertissement": "",
-                                "sections": 0}
+                                "sections": 0, "claude": {}}
         try:
             c = entete.lire(p)
             info["description"] = c.description
+            info["claude"] = c.claude
             info["sections"] = len(Jalons.depuis(c.corps).noms)
             if not c.corps.strip():
                 info["avertissement"] = "Fichier vide : Claude n'aurait aucune consigne."
@@ -579,6 +580,8 @@ class Traitement:
             "nom": self.audio.stem, "dossier": str(self.dossier),
             "consignes": self.consignes.stem if self.consignes else "",
             "avertissements": self.avertissements, "id": self.id,
+            "claude": {"modele": self.options.get("claude_modele") or "",
+                       "effort": self.options.get("claude_effort") or ""},
         }
 
     def maj(self, etape: str, *, statut: str | None = None,
@@ -801,6 +804,32 @@ def consigne(avec_supports: bool) -> str:
     return texte
 
 
+# Modèles proposés dans l'interface. Les alias de Claude Code suivent les
+# nouvelles versions d'eux-mêmes (« opus » = le dernier Opus disponible) ; un
+# identifiant complet (claude-opus-5-5, opus[1m]…) reste possible via « Autre ».
+MODELES_CLAUDE = (
+    ("", "Par défaut du compte"),
+    ("best", "Le meilleur disponible"),
+    ("fable", "Fable — le plus capable, cours longs"),
+    ("opus", "Opus — raisonnement soigné"),
+    ("sonnet", "Sonnet — équilibré, plus rapide"),
+    ("haiku", "Haiku — rapide et économe"),
+)
+EFFORTS_CLAUDE = (
+    ("", "Par défaut"), ("low", "Faible"), ("medium", "Moyen"), ("high", "Élevé"),
+    ("xhigh", "Très élevé"), ("max", "Maximum"),
+)
+
+
+def reglages_claude(options: dict[str, Any]) -> tuple[str, str]:
+    """(modèle, effort) demandés par l'interface, vérifiés ; ValueError sinon."""
+    try:
+        return (entete.modele_valide(options.get("claude_modele") or ""),
+                entete.effort_valide(options.get("claude_effort") or ""))
+    except ValueError as exc:
+        raise ValueError(f"Réglage Claude : {exc}.") from exc
+
+
 # Garde-fous de l'appel à Claude. L'ancien couperet fixe (30 min) tombait en
 # pleine rédaction d'un cours long — et ne tuait que claude.cmd, pas node.
 INACTIVITE_MAX = 20 * 60   # plus aucune ligne reçue depuis ce délai : on coupe
@@ -1021,14 +1050,25 @@ def _texte_resultat(ev: dict[str, Any]) -> str:
     return ""
 
 
-def _expliquer(message: str, code: Optional[int]) -> str:
+def _expliquer(message: str, code: Optional[int], modele: str = "") -> str:
     """Traduit les erreurs connues de Claude Code en consigne actionnable."""
     bas = message.lower()
+    nom = f"« {modele} »" if modele else "par défaut"
+    if re.search(r"issue with the selected model|not_found_error|invalid model|unknown model|"
+                 r"model[^.]{0,60}(not exist|not found|not available|isn.t available|"
+                 r"unavailable|not supported|no access|not have access)", bas):
+        return (f"Le modèle Claude {nom} n'existe pas ou n'est pas disponible avec ton "
+                "abonnement. Choisis-en un autre et « Relancer la synthèse ». "
+                f"({message[:160]})")
+    if "effort" in bas and re.search(r"not supported|invalid|unsupported|not available", bas):
+        return (f"Ce niveau d'effort n'est pas disponible pour le modèle {nom}. Choisis "
+                f"« Par défaut » ou un autre niveau, puis relance. ({message[:160]})")
     if re.search(r"usage limit|rate limit|limit (will )?reset|hit your limit|"
                  r"limite d.utilisation|too many requests|429", bas):
-        return ("Limite d'utilisation de ton abonnement Claude atteinte. "
-                "Attends la réinitialisation puis « Relancer la synthèse ». "
-                f"({message[:160]})")
+        return ("Limite d'utilisation de ton abonnement Claude atteinte"
+                + (f" pour le modèle {nom}" if modele else "") + ". Attends la "
+                "réinitialisation, ou relance la synthèse avec un autre modèle "
+                f"(Sonnet, Haiku). ({message[:160]})")
     if re.search(r"not logged in|log ?in|authenticat|api key|unauthori|401|"
                  r"invalid.*token|oauth", bas):
         return ("Claude Code n'est pas connecté. Ouvre une invite de commandes, "
@@ -1121,6 +1161,8 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
     partiel = ""
     section = 0
     mots = 0
+    modele_reel = ""
+    demande = commande[commande.index("--model") + 1] if "--model" in commande else ""
 
     try:
         for ligne in proc.stdout:  # type: ignore[union-attr]
@@ -1147,6 +1189,9 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
                 tracer(ligne)
             if genre == "result":
                 resultat = ev
+            if genre == "system" and ev.get("subtype") == "init" and ev.get("model"):
+                modele_reel = str(ev.get("model"))
+                t.maj("synthese", detail=f"Claude lit la transcription · {modele_reel}")
             if genre == "assistant":
                 # Claude lit les supports avant de rédiger : on le montre.
                 for b in (ev.get("message") or {}).get("content") or []:
@@ -1205,8 +1250,13 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
         if proc.returncode != 0:
             noter(f"claude : code {proc.returncode} mais résultat complet, on le garde")
         u = (resultat or {}).get("usage") or {}
+        par_modele = (resultat or {}).get("modelUsage")
+        modeles = list(par_modele) if isinstance(par_modele, dict) else []
         usage = {"entree": u.get("input_tokens"), "sortie": u.get("output_tokens"),
-                 "duree": (resultat or {}).get("duration_ms")}
+                 "duree": (resultat or {}).get("duration_ms"),
+                 "modele": modele_reel or (modeles[0] if modeles else demande),
+                 "modeles": modeles}
+        noter(f"claude : synthèse par {usage['modele'] or 'le modèle par défaut'}")
         return markdown, usage
 
     # --- échec : reconstituer le message le plus parlant -------------------
@@ -1234,7 +1284,7 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
     if garde["motif"]:
         message = f"Synthèse interrompue : {garde['motif']}."
     else:
-        message = _expliquer(message, proc.returncode)
+        message = _expliquer(message, proc.returncode, demande)
 
     brouillon = texte_assistant or texte_deltas
     if len(brouillon.strip()) > 200:
@@ -1324,6 +1374,13 @@ def synthetiser(t: Traitement, transcription: Path) -> Path:
             "--max-turns", str(min(80, 12 + lectures))]
     if lectures:
         base += ["--allowedTools", "Read"]
+    modele, effort = reglages_claude(t.options)
+    if modele:
+        base += ["--model", modele]
+    if effort:
+        base += ["--effort", effort]
+    t.maj("synthese", detail="Claude lit la transcription"
+          + (f" · {modele}" if modele else "") + (f" · effort {effort}" if effort else ""))
     # Du plus bavard au plus sobre : chaque repli perd un peu d'avancement
     # mais reste fonctionnel sur une version plus ancienne du CLI.
     tentatives = [
@@ -1332,14 +1389,32 @@ def synthetiser(t: Traitement, transcription: Path) -> Path:
         base + ["--output-format", "stream-json", "--verbose"],
         base + ["--output-format", "json"],
     ]
+    # Options dont on peut se passer si le CLI ne les connaît pas encore.
+    facultatives = ["--effort"] if effort else []
+
+    def sans(commande: list[str], drapeau: str) -> list[str]:
+        i = commande.index(drapeau)
+        return commande[:i] + commande[i + 2:]
 
     def essayer() -> tuple[str, dict[str, Any]]:
+        nonlocal tentatives
         derniere: Optional[Exception] = None
-        for commande in tentatives:
+        i = 0
+        while i < len(tentatives):
             try:
-                return _appeler_claude(t, commande, entree, jalons)
+                return _appeler_claude(t, tentatives[i], entree, jalons)
             except _OptionInconnue as exc:
                 derniere = exc
+                gene = next((d for d in facultatives if d.lstrip("-") in str(exc)), None)
+                if gene:
+                    facultatives.remove(gene)
+                    tentatives = [sans(c, gene) for c in tentatives]
+                    remarque = (f"Claude Code ne connaît pas encore {gene} : "
+                                "synthèse lancée sans ce réglage.")
+                    noter(remarque)
+                    t.avertissements.append(remarque)
+                    continue
+                i += 1
         raise RuntimeError(str(derniere)[:400] if derniere else
                            "Claude Code n'a accepté aucun format de sortie.")
 
@@ -1483,6 +1558,15 @@ class Passerelle:
                               else f"{max(1, round(taille / 1024))} Ko")
         return info
 
+    # -- modèle Claude --------------------------------------------------
+    def options_claude(self) -> dict[str, Any]:
+        """Les choix proposés et le dernier réglage utilisé."""
+        r = lire_reglages()
+        return {"modeles": [{"valeur": v, "libelle": l} for v, l in MODELES_CLAUDE],
+                "efforts": [{"valeur": v, "libelle": l} for v, l in EFFORTS_CLAUDE],
+                "choisi": {"modele": r.get("claude_modele", ""),
+                           "effort": r.get("claude_effort", "")}}
+
     # -- consignes -----------------------------------------------------
     def lister_consignes(self) -> dict[str, Any]:
         modeles = liste_consignes()
@@ -1594,7 +1678,12 @@ class Passerelle:
             consignes = chemin_consignes(options.get("consignes") or "")
         except FileNotFoundError as exc:
             return {"erreur": f"{exc} Choisis un modèle dans « Consignes de synthèse »."}
-        ecrire_reglages(consignes=consignes.stem)
+        try:
+            modele, effort = reglages_claude(options)
+        except ValueError as exc:
+            return {"erreur": str(exc)}
+        options = dict(options, claude_modele=modele, claude_effort=effort)
+        ecrire_reglages(consignes=consignes.stem, claude_modele=modele, claude_effort=effort)
 
         if source.suffix.lower() == ".md":
             return self._pdf_seul(source, options, consignes)
@@ -1608,13 +1697,22 @@ class Passerelle:
         threading.Thread(target=self._pipeline, args=(t,), daemon=True).start()
         return t.instantane()
 
-    def relancer_synthese(self) -> dict[str, Any]:
+    def relancer_synthese(self, claude: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """Après un échec de la synthèse : on repart de la transcription déjà
-        faite, dans le même dossier, sans refaire passer l'audio au GPU."""
+        faite, dans le même dossier, sans refaire passer l'audio au GPU. Le
+        modèle Claude peut changer (limite atteinte, modèle indisponible)."""
         t = self._courant
-        noter("appel relancer_synthese")
+        noter(f"appel relancer_synthese {claude or ''}")
         if not t or t.etat == "en_cours":
             return {"erreur": "Rien à relancer."}
+        if claude is not None:
+            try:
+                modele, effort = reglages_claude({"claude_modele": claude.get("modele"),
+                                                  "claude_effort": claude.get("effort")})
+            except ValueError as exc:
+                return {"erreur": str(exc)}
+            t.options = dict(t.options, claude_modele=modele, claude_effort=effort)
+            ecrire_reglages(claude_modele=modele, claude_effort=effort)
         transcription = Path(t.fichiers.get("txt") or t.dossier / "transcription.txt")
         if not transcription.exists():
             return {"erreur": "transcription.txt est introuvable : relance le cours "

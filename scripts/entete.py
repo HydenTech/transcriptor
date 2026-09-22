@@ -60,6 +60,14 @@ _ALIAS = {
 
 _FORMATS = {"a3": "A3", "a4": "A4", "a5": "A5", "letter": "Letter", "legal": "Legal"}
 
+# Modèle Claude : un alias de Claude Code (opus, sonnet…) ou un identifiant
+# complet (claude-opus-5-5, opus[1m]…). Niveaux d'effort de `claude --effort`.
+RE_MODELE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{1,79}")
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+_EFFORTS_FR = {"faible": "low", "bas": "low", "moyen": "medium", "eleve": "high",
+               "haut": "high", "tres eleve": "xhigh", "tres_eleve": "xhigh",
+               "maximum": "max", "maximal": "max"}
+
 _RE_ENTETE = re.compile(r"\A\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.S)
 
 
@@ -86,6 +94,7 @@ class Consignes:
     corps: str
     pdf: dict
     avertissements: list[str] = field(default_factory=list)
+    claude: dict = field(default_factory=dict)      # {"modele": …, "effort": …}
 
     @property
     def description(self) -> str:
@@ -100,7 +109,53 @@ def lire(chemin: Path | str) -> Consignes:
 def depuis_texte(texte: str, chemin: Optional[Path] = None) -> Consignes:
     meta, corps, avert = separer(texte)
     pdf, avert_pdf = reglages_pdf(meta)
-    return Consignes(chemin, meta, corps, pdf, avert + avert_pdf)
+    claude, avert_claude = reglages_claude(meta)
+    return Consignes(chemin, meta, corps, pdf, avert + avert_pdf + avert_claude, claude)
+
+
+def modele_valide(v: Any) -> str:
+    """Nom de modèle nettoyé, ou ValueError. Vide = modèle par défaut du compte."""
+    s = _texte(v).strip()
+    if sans_accent(s) in ("", "defaut", "par defaut", "default", "compte"):
+        return ""
+    if not RE_MODELE.fullmatch(s):
+        raise ValueError(f"nom de modèle invalide : {s[:40]}")
+    return s
+
+
+def effort_valide(v: Any) -> str:
+    """Niveau d'effort de Claude Code, ou ValueError. Vide = par défaut."""
+    s = " ".join(sans_accent(_texte(v)).replace("-", " ").split())
+    if s in ("", "defaut", "par defaut", "default"):
+        return ""
+    s = _EFFORTS_FR.get(s, s)
+    if s not in EFFORTS:
+        raise ValueError("effort attendu : low, medium, high, xhigh ou max")
+    return s
+
+
+def reglages_claude(meta: dict) -> tuple[dict, list[str]]:
+    """Bloc facultatif `claude:` — le modèle et l'effort proposés quand ce
+    modèle de consignes est choisi (l'interface permet de les changer)."""
+    r = {"modele": "", "effort": ""}
+    brut = meta.get("claude") if isinstance(meta, dict) else None
+    if brut is None:
+        return r, []
+    if not isinstance(brut, dict):
+        return r, ["« claude: » doit être suivi de « modele: » et/ou « effort: », indentés"]
+    avert: list[str] = []
+    for k, v in brut.items():
+        cle = _cle(k)
+        try:
+            if cle in ("modele", "model"):
+                r["modele"] = modele_valide(v)
+            elif cle in ("effort", "reflexion"):
+                r["effort"] = effort_valide(v)
+            else:
+                avert.append(f"réglage claude inconnu ignoré : {k}")
+        except ValueError as exc:
+            avert.append(f"claude.{k} : {exc}")
+    return r, avert
 
 
 def separer(texte: str) -> tuple[dict, str, list[str]]:

@@ -29,6 +29,8 @@ Quelques champs, puis un bouton :
 - **Matière** — pré-remplie depuis le nom du fichier, corrige si besoin.
 - **Consignes de synthèse** — le modèle qui dit à Claude quoi rédiger et au PDF
   comment se présenter. Voir [Régler la sortie](#régler-la-sortie).
+- **Modèle Claude** et **effort** — qui rédige la synthèse. Voir
+  [Choisir le modèle Claude](#choisir-le-modèle-claude).
 - **Vocabulaire du chapitre** — le levier le plus rentable. Whisper recopie la
   casse qu'il lit ici : écrire `ArrayList<String>` évite « array liste ». Une
   trentaine de termes maximum. Les titres des diapos jointes s'y ajoutent
@@ -128,6 +130,40 @@ liste des consignes et remplacé par sa valeur par défaut.
 
 Pour **ajuster la mise en page** sans relancer Claude : modifie l'en-tête `pdf:`,
 puis **Refaire le PDF** sur l'écran de résultat.
+
+## Choisir le modèle Claude
+
+Deux listes sous les consignes règlent la synthèse (et seulement elle) :
+
+| Modèle | Pour quoi |
+|---|---|
+| *Par défaut du compte* | le modèle réglé pour ton abonnement dans Claude Code |
+| **Le meilleur disponible** (`best`) | le plus capable auquel ton compte a accès |
+| **Fable** | le plus capable, taillé pour les longues tâches : cours de 2 h avec beaucoup de supports |
+| **Opus** | raisonnement soigné ; bon choix pour des fiches exigeantes |
+| **Sonnet** | équilibré, nettement plus rapide |
+| **Haiku** | rapide et économe : résumé express, quiz |
+| *Autre identifiant…* | un nom complet (`claude-opus-5-5`) ou une variante (`opus[1m]`, `sonnet[1m]` pour un contexte d'un million de tokens) |
+
+Les noms courts sont des alias de Claude Code : ils suivent d'eux-mêmes les
+nouvelles versions. L'**effort** (`low` → `max`) règle le temps de réflexion :
+plus haut, plus fin, plus lent. Tous les niveaux n'existent pas pour tous
+les modèles.
+
+- Le choix est mémorisé d'un lancement à l'autre.
+- Un modèle de consignes peut proposer son modèle Claude (bloc `claude:` de
+  l'en-tête, voir l'exemple commenté dans *Cours complet*) : le choisir dans la
+  liste présélectionne ce modèle, que tu peux encore changer.
+- Le modèle réellement utilisé s'affiche sous le support (« Synthèse par
+  claude-… ») et dans `synthese.log`.
+- **Limite d'utilisation atteinte** ou **modèle indisponible** : l'écran d'erreur
+  propose de relancer la synthèse avec un autre modèle, sans retranscrire.
+
+```yaml
+claude:
+  modele: sonnet
+  effort: medium
+```
 
 ## Diapos et photos du tableau
 

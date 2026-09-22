@@ -9,6 +9,12 @@
 
 description: Support complet en 10 sections — résumé, plan, points clés, fiches, signaux examen, lexique, quiz.
 
+# Modèle Claude proposé quand ces consignes sont choisies (il reste modifiable
+# dans l'app). Retire les « # » des trois lignes suivantes pour l'activer :
+# claude:
+#   modele: opus                    # best, fable, opus, sonnet, haiku, ou un identifiant complet
+#   effort: high                    # low, medium, high, xhigh, max
+
 pdf:
   couverture: oui
   surtitre: Support de révision
