@@ -316,6 +316,43 @@ def poser_icone(titre: str = "Transcriptor", patience: float = 15.0) -> None:
     noter("icône posée")
 
 
+def taille_fenetre() -> tuple[int, int, bool]:
+    """(largeur, hauteur, agrandie) de la fenêtre au lancement, en pixels
+    logiques, d'après la zone utile de l'écran (sans la barre des tâches).
+
+    L'écran de choix passe sur deux colonnes dès 960 px de large et tient
+    alors en ~760 px de haut : on vise cette largeur, toute la hauteur utile
+    jusqu'à 940 px, et la fenêtre agrandie sur les petits écrans."""
+    defaut = (1240, 900, False)
+    if os.name != "nt":
+        return defaut
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        u32 = ctypes.windll.user32
+        zone = wintypes.RECT()
+        if not u32.SystemParametersInfoW(0x0030, 0, ctypes.byref(zone), 0):  # SPI_GETWORKAREA
+            return defaut
+        largeur = zone.right - zone.left
+        hauteur = zone.bottom - zone.top
+        # Un processus qui gère le DPI reçoit des pixels physiques ;
+        # pywebview attend des pixels logiques (96 ppp).
+        try:
+            if u32.IsProcessDPIAware():
+                echelle = u32.GetDpiForSystem() / 96 or 1
+                largeur, hauteur = largeur / echelle, hauteur / echelle
+        except Exception:  # noqa: BLE001  (Windows antérieur à 10)
+            pass
+        noter(f"zone utile de l'écran : {int(largeur)}×{int(hauteur)}")
+        if hauteur < 800 or largeur < 1040:
+            return int(min(largeur, 1240)), int(hauteur), True
+        return int(min(largeur - 48, 1240)), int(min(hauteur - 24, 940)), False
+    except Exception as exc:  # noqa: BLE001
+        noter(f"taille de fenêtre par défaut ({exc})")
+        return defaut
+
+
 def preparer_webview2() -> None:
     """Un profil WebView2 neuf à chaque lancement. Un processus fantôme ne
     peut donc plus verrouiller le profil de la session suivante — c'est ce
@@ -1938,11 +1975,16 @@ def main() -> None:
 
     noter(f"pywebview {getattr(webview, '__version__', '?')}")
     passerelle = Passerelle()
+    # Toute l'application visible dès l'ouverture : la fenêtre prend la hauteur
+    # utile de l'écran (agrandie sur un petit écran), et la page passe sur deux
+    # colonnes dès qu'elle est assez large.
+    largeur, hauteur, agrandie = taille_fenetre()
     fenetre = webview.create_window(
         "Transcriptor",
         str(APP_DIR / "static" / "index.html"),
         js_api=passerelle,
-        width=980, height=860, min_size=(560, 620),
+        width=largeur, height=hauteur, min_size=(560, 620),
+        maximized=agrandie,
         background_color="#EDEFE9",
     )
     passerelle._fenetre = fenetre

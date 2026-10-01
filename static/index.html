@@ -187,6 +187,30 @@ ol.steps li[data-cache="1"]{display:none}
 .relance .etiquette{font-size:13px;color:var(--ink-2)}
 .md .img-ph{font-family:var(--mono);font-size:12px;color:var(--ink-2)}
 
+/* Écran de choix sur une fenêtre assez large : deux colonnes, pour que tout
+   tienne sans défiler — à gauche le titre et le cours, à droite les réglages. */
+#panel-choix[hidden]{display:none!important}
+/* Pendant le traitement et au résultat, le titre se fait discret : la place
+   va aux étapes et au support. */
+body[data-ecran="suivi"]{padding-top:22px}
+body[data-ecran="suivi"] h1{font-size:24px;max-width:none;margin-bottom:16px}
+body[data-ecran="suivi"] .lede{display:none}
+body[data-ecran="suivi"] .eyebrow{margin-bottom:8px}
+#panel-reglages .fields{margin-top:0}
+@media (min-width:960px){
+  body[data-ecran="choix"]{padding:26px 32px 30px}
+  body[data-ecran="choix"] .wrap{max-width:1240px;display:grid;
+    grid-template-columns:minmax(360px,5fr) 6fr;column-gap:24px;align-items:start;
+    grid-template-areas:"entete reglages" "cours reglages"}
+  body[data-ecran="choix"] header{grid-area:entete}
+  body[data-ecran="choix"] #panel-choix{display:contents}
+  body[data-ecran="choix"] #panel-cours{grid-area:cours}
+  body[data-ecran="choix"] #panel-reglages{grid-area:reglages}
+  body[data-ecran="choix"] .lede{margin-bottom:20px}
+  body[data-ecran="choix"] .pick{padding:24px 18px}
+  body[data-ecran="choix"] .fields{margin-top:0}
+  body[data-ecran="suivi"] .wrap{max-width:920px}
+}
 @media (max-width:600px){
   .fields{grid-template-columns:1fr}
   ol.steps li{grid-template-columns:22px 1fr;row-gap:2px}
@@ -195,7 +219,7 @@ ol.steps li[data-cache="1"]{display:none}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
-<body>
+<body data-ecran="choix">
 <div class="wrap">
 
   <header>
@@ -206,7 +230,8 @@ ol.steps li[data-cache="1"]{display:none}
       croise le tout et rédige selon le modèle de consignes choisi.</p>
   </header>
 
-  <section class="panel" id="panel-choix">
+  <div id="panel-choix">
+  <section class="panel" id="panel-cours">
     <p class="panel-title">Le cours</p>
 
     <div class="pick" id="pick" tabindex="0" role="button">
@@ -226,7 +251,10 @@ ol.steps li[data-cache="1"]{display:none}
         formules et schémas complétés, renvois « diapo 12 », « photo 2 ».</p>
       <ul class="fichiers" id="liste-supports"></ul>
     </div>
+  </section>
 
+  <section class="panel" id="panel-reglages">
+    <p class="panel-title">Réglages</p>
     <div class="fields">
       <div class="field">
         <label for="matiere">Matière</label>
@@ -266,16 +294,15 @@ ol.steps li[data-cache="1"]{display:none}
         <label for="claude-effort">Effort de Claude</label>
         <select id="claude-effort"><option value="">Par défaut</option></select>
       </div>
-      <p class="hint pleine">Les noms courts (Opus, Sonnet…) suivent d'eux-mêmes les nouvelles
-        versions. Un modèle plus puissant ou un effort plus élevé rédige plus finement, mais
-        prend plus de temps et use plus vite ta limite d'utilisation : si elle est atteinte,
-        relance la synthèse avec un autre modèle.</p>
+      <p class="hint pleine">Plus puissant ou plus d'effort : rédaction plus fine, mais plus
+        lente et plus gourmande en limite d'utilisation. Opus, Sonnet… suivent d'eux-mêmes
+        les nouvelles versions.</p>
       <div class="field wide">
         <label for="termes">Vocabulaire du chapitre</label>
         <textarea id="termes" placeholder="ArrayList&lt;String&gt;, HashMap, try/catch, throws Exception, System.out.println, polymorphisme"></textarea>
-        <p class="hint">Whisper recopie la casse qu'il lit ici. Écris les termes
-          exactement comme tu veux les retrouver — c'est ce qui sauve le camelCase.
-          Une trentaine de termes maximum. Les titres des diapos jointes s'y ajoutent.</p>
+        <p class="hint">Whisper recopie la casse qu'il lit ici : écris les termes comme tu
+          veux les retrouver (camelCase compris). Une trentaine au plus ; les titres des
+          diapos jointes s'y ajoutent.</p>
       </div>
     </div>
 
@@ -283,6 +310,7 @@ ol.steps li[data-cache="1"]{display:none}
     <p class="outil" id="etat-claude" data-etat="inconnu"></p>
     <div id="erreur-choix"></div>
   </section>
+  </div>
 
   <section class="panel" id="panel-etapes" hidden>
     <p class="panel-title">En cours</p>
@@ -583,6 +611,7 @@ $("#go").addEventListener("click", async () => {
   fini = false;
   $("#panel-resultat").hidden = true;
   $("#panel-choix").hidden = true;
+  document.body.dataset.ecran = "suivi";
   $("#panel-etapes").hidden = false;
   window.majEtat(r);
   } catch (e) {
