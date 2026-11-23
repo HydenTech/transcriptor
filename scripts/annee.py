@@ -41,7 +41,12 @@ EXT_AUDIO = (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".opus", ".mp4", ".aac",
 EXT_HORAIRE = (".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff",
                ".heic", ".heif", ".xlsx", ".xlsm", ".csv", ".ics", ".docx", ".txt",
                ".html", ".htm", ".json")
-EXT_SUPPORTS = (".pdf", ".pptx", ".ppt", ".docx", ".txt", ".md", ".jpg", ".jpeg", ".png",
+# Supports de cours cherchés dans les dossiers des matières (même liste que
+# supports.EXT_SUPPORTS) : les anciens formats (.ppt, .doc…) sont trouvés pour
+# être signalés « à convertir ».
+EXT_SUPPORTS = (".pdf", ".pptx", ".ppsx", ".pptm", ".ppsm", ".potx", ".ppt", ".pps",
+                ".docx", ".docm", ".dotx", ".doc", ".rtf", ".odt", ".odp",
+                ".txt", ".md", ".jpg", ".jpeg", ".png",
                 ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heif")
 
 DOSSIER_AUDIOS = "00 - Audios et horaire"

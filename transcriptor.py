@@ -1617,8 +1617,10 @@ def preparer_atelier(t: Traitement, corps: str, transcription: Path) -> Path:
             except OSError as exc:
                 noter(f"support {s.fichier} non copié : {exc}")
 
+    # Syllabus et diapositives repérés à leur nom : Claude sait ce qui fait foi.
     bloc = sup.bloc_pour_claude(t.supports, t.dossier / "supports",
-                                debut=t.debut, duree=t.duree, racine=copie)
+                                debut=t.debut, duree=t.duree, racine=copie,
+                                roles={s.origine: sup.role_document(s.origine) for s in t.supports})
     texte = transcription.read_text(encoding="utf-8", errors="replace").strip()
     entree = atelier / "entree_claude.txt"
     entree.write_text(
@@ -2051,6 +2053,20 @@ class _PlanMatiere:
         return etat_matiere(self.travail, self.notes(), self.documents())
 
 
+def trier_documents(sources: list[Path]) -> tuple[list[Path], list[Path]]:
+    """Les documents d'une matière que Transcriptor sait lire, et ceux trouvés
+    mais à convertir d'abord (.ppt, .doc, .odt…) : ces derniers sont montrés
+    dans l'interface, jamais comptés comme intégrés aux fiches."""
+    lisibles, a_convertir = [], []
+    for p in sources:
+        genre = sup.genre_de(p)
+        (a_convertir if genre in ("a_convertir", "") else lisibles).append(p)
+    return lisibles, a_convertir
+
+
+ORDRE_ROLES = {"syllabus": 0, "diapositives": 1, "": 2}
+
+
 def etat_matiere(travail: Path, notes: dict[str, Path], documents: dict[str, Path]) -> suivi.EtatMatiere:
     """Ce que contiennent déjà les fiches et les infos d'une matière (un
     etat.json d'avant est traduit au passage)."""
@@ -2206,7 +2222,8 @@ class Chantier:
                     travail = dossier / TRAVAIL
                     notes = {x.cle: travail / "seances" / f"{x.cle}.md" for x in seances}
                     documents = {}
-                    for p in (a.supports_matiere(m) if dossier.is_dir() else []):
+                    lisibles = trier_documents(a.supports_matiere(m))[0] if dossier.is_dir() else []
+                    for p in lisibles:
                         documents[p.relative_to(dossier).as_posix()] = p
                     etats[c.matiere] = etat_matiere(travail, notes, documents)
                 etat = etats[c.matiere]
@@ -2403,7 +2420,11 @@ class Chantier:
                 continue
             seances = analyse.seances.get(m.nom, [])
             dossier = a.dossier_matiere(m)
-            sources = a.supports_matiere(m)
+            sources, illisibles = trier_documents(a.supports_matiere(m))
+            if illisibles and self.genre == "tout":
+                self.remarque(f"{m.titre} : " + " ; ".join(
+                    f"« {x.name} » — {sup.conversion(x)}" for x in illisibles[:4])
+                    + (f" (et {len(illisibles) - 4} autre(s))" if len(illisibles) > 4 else ""))
             if self.genre == "word":
                 if (dossier / TRAVAIL / "fiches.md").is_file() or (dossier / TRAVAIL / "infos.md").is_file():
                     pm = _PlanMatiere(m, dossier, sources)
@@ -2511,12 +2532,16 @@ class Chantier:
                 chemins[p.name] = p.relative_to(pm.dossier).as_posix()
             except ValueError:
                 chemins[p.name] = p.name
-        # Les documents rangés à la racine du dossier passent en premier.
-        ordre = {p.name: (len(p.relative_to(pm.dossier).parts) if p.is_relative_to(pm.dossier) else 9)
+        # Le syllabus d'abord (plan et modalités du cours), puis les
+        # diapositives, puis le reste ; à rang égal, la racine du dossier avant
+        # les sous-dossiers. Le budget de texte va ainsi d'abord à l'essentiel.
+        roles = {p.name: sup.role_document(p.name) for p in pm.sources}
+        ordre = {p.name: (ORDRE_ROLES.get(roles[p.name], 2),
+                          len(p.relative_to(pm.dossier).parts) if p.is_relative_to(pm.dossier) else 9)
                  for p in pm.sources}
-        supports = sorted(supports_, key=lambda s: ordre.get(s.origine, 9))
+        supports = sorted(supports_, key=lambda s: ordre.get(s.origine, (2, 9)))
         return sup.bloc_pour_claude(supports, pm.travail / "supports", racine=copie,
-                                    budget=budget, chemins=chemins,
+                                    budget=budget, chemins=chemins, roles=roles,
                                     intro="Documents rangés dans le dossier de la matière")
 
     def _bloc_matiere(self, pm: _PlanMatiere) -> str:
@@ -3018,7 +3043,8 @@ def instantane_annee(a: an.Annee, chantier: Optional[Chantier]) -> dict[str, Any
             travail = dossier / TRAVAIL
             seances = analyse.seances.get(m.nom, [])
             audios = [c for s in seances for c in s.audios]
-            sources = a.supports_matiere(m) if dossier.is_dir() else []
+            tous = a.supports_matiere(m) if dossier.is_dir() else []
+            sources, illisibles = trier_documents(tous)
             notes = {s.cle: travail / "seances" / f"{s.cle}.md" for s in seances}
             documents = {}
             for p in sources:
@@ -3027,13 +3053,50 @@ def instantane_annee(a: an.Annee, chantier: Optional[Chantier]) -> dict[str, Any
             infos = dossier / f"{nom_fichier_matiere(m)} - {an.INFOS}.docx"
             etat = etat_matiere(travail, notes, documents)
             dans_fiches = 0
+            detail_seances = []
             for s in seances:
                 n = notes[s.cle]
+                integre = ""
                 if n.is_file():
                     notes_faites.add((m.nom, s.cle))
                     if etat.fiches.seance_integree(s.cle, n) and etat.infos.seance_integree(s.cle, n):
-                        integrees[(m.nom, s.cle)] = etat.fiches.date_seance(s.cle)
+                        integre = integrees[(m.nom, s.cle)] = etat.fiches.date_seance(s.cle)
                         dans_fiches += 1
+                tous_transcrits = all(transcrits.get(c.audio.relatif) for c in s.audios)
+                detail_seances.append({
+                    "cle": s.cle, "date": f"{an.JOURS[s.date.weekday()][:3]} {s.date:%d/%m}" if s.date else "",
+                    "heure": f"{s.audios[0].audio.debut:%H:%M}" if s.audios and s.audios[0].audio.debut
+                    and s.audios[0].audio.precision == "heure" else "",
+                    "audios": [{"nom": c.audio.nom, "titre": c.audio.titre or c.audio.nom,
+                                "duree": an.duree_lisible(c.audio.duree)} for c in s.audios],
+                    "etat": ("fiches" if integre and tous_transcrits else
+                             "notes" if n.is_file() and tous_transcrits else
+                             "transcrit" if tous_transcrits else "nouveau"),
+                    "integre": _date_courte(integre)})
+            # Les documents trouvés dans le dossier de la matière, tels que
+            # Transcriptor les voit : rôle (syllabus, diapositives), format,
+            # dans les fiches ou pas encore, ou à convertir.
+            detail_docs = []
+            for q in tous:
+                rel = q.relative_to(dossier).as_posix()
+                lisible = rel in documents
+                dans = lisible and etat.fiches.support_integre(rel, q) and etat.infos.support_integre(rel, q)
+                try:
+                    taille = q.stat().st_size
+                except OSError:
+                    taille = 0
+                detail_docs.append({
+                    "nom": q.name, "relatif": rel, "chemin": str(q),
+                    "sous_dossier": rel.rsplit("/", 1)[0] if "/" in rel else "",
+                    "role": sup.role_document(q.name), "format": sup.libelle_format(q),
+                    "taille": (f"{taille / 1048576:.1f} Mo" if taille >= 1048576
+                               else f"{max(1, round(taille / 1024))} Ko") if taille else "",
+                    "etat": "fiches" if dans else ("nouveau" if lisible else "a_convertir"),
+                    "integre": _date_courte(str((etat.fiches.supports.get(rel) or {}).get("le") or ""))
+                    if dans else "",
+                    "conseil": "" if lisible else sup.conversion(q)})
+            detail_docs.sort(key=lambda d: (ORDRE_ROLES.get(d["role"], 2), d["etat"] == "a_convertir",
+                                            d["relatif"].count("/"), d["relatif"].lower()))
             docs_a_jour = all(etat.fiches.support_integre(r, q) and etat.infos.support_integre(r, q)
                               for r, q in documents.items())
             a_jour = (fiches.is_file() and infos.is_file() and dans_fiches == len(seances)
@@ -3045,6 +3108,7 @@ def instantane_annee(a: an.Annee, chantier: Optional[Chantier]) -> dict[str, Any
                 "chemin": str(dossier), "prevues": h.seances_prevues(m.nom), "seances": len(seances),
                 "audios": len(audios), "transcrits": sum(1 for c in audios if transcrits.get(c.audio.relatif)),
                 "notes": sum(1 for n in notes.values() if n.is_file()), "supports": len(sources),
+                "a_convertir": len(illisibles), "documents": detail_docs, "detail_seances": detail_seances,
                 "dans_fiches": dans_fiches, "nouvelles": len(seances) - dans_fiches,
                 "docs_nouveaux": 0 if docs_a_jour else sum(
                     1 for r, q in documents.items()
@@ -3197,12 +3261,13 @@ class Passerelle:
             info["erreur"] = "introuvable"
         elif not genre:
             info["erreur"] = f"format {p.suffix or 'inconnu'} non pris en charge"
-        elif genre == "ppt":
-            info["erreur"] = "ancien format .ppt : enregistre-le en .pptx ou en PDF"
+        elif genre == "a_convertir":
+            info["erreur"] = sup.conversion(p)
         else:
             taille = p.stat().st_size
             info["taille"] = (f"{taille / 1048576:.1f} Mo" if taille >= 1048576
                               else f"{max(1, round(taille / 1024))} Ko")
+            info["role"] = sup.role_document(p.name, genre)
         return info
 
     # -- modèle Claude --------------------------------------------------

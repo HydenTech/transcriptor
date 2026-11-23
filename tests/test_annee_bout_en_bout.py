@@ -364,6 +364,123 @@ def test_ajouts_rangement_et_reecriture():
         assert e["2026-09-22 08_40_00.ogg"]["etape"] == "fiches" and not e["2026-09-22 08_40_00.ogg"]["range"]
 
 
+def _diapos(chemin: Path, titre: str, texte: str) -> None:
+    import pptx
+    pres = pptx.Presentation()
+    diapo = pres.slides.add_slide(pres.slide_layouts[1])
+    diapo.shapes.title.text = titre
+    diapo.placeholders[1].text = texte
+    pres.save(chemin)
+
+
+def _entrees(tmp: Path, genre: str) -> dict[str, str]:
+    """Les entrées remises à Claude (fiches, infos…), par dossier d'atelier."""
+    ateliers = (tmp / "env" / "local" / "Transcriptor" / "atelier").glob(f"annee-{genre}-*")
+    return {a.name: (a / "entree_claude.txt").read_text("utf-8") for a in ateliers
+            if (a / "entree_claude.txt").is_file()}
+
+
+def test_supports_de_cours():
+    """Les supports posés dans le dossier d'une matière (syllabus, PowerPoint,
+    notes…) : montrés matière par matière avec leur rôle et leur état, lus
+    avec les séances — le syllabus d'abord ; un ancien format est signalé à
+    convertir ; un support ajouté en cours d'année est intégré sans tout
+    refaire."""
+    import docx
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        tr = _environnement(tmp)
+        racine = _annee(tmp)
+        psy = racine / "Psycho"
+        doc = docx.Document()
+        doc.add_heading("Psychologie du développement", level=1)
+        doc.add_paragraph("Objectifs : situer les grandes théories du développement. "
+                          "Évaluation : examen écrit en janvier, questions ouvertes.")
+        doc.save(psy / "Syllabus Psychologie 2026-2027.docx")
+        _diapos(psy / "Cours 1 - Attachement.pptx", "La théorie de l'attachement", "Bowlby, Ainsworth")
+        (psy / "Cours 0 - Introduction.ppt").write_bytes(b"\xd0\xcf\x11\xe0 ancien format")
+        (psy / "Travail de groupe").mkdir()
+        (psy / "Travail de groupe" / "Sources.txt").write_text("Sources : Baltes, Salthouse.",
+                                                              encoding="utf-8")
+        p = tr.Passerelle()
+        p.ouvrir_annee(str(racine))
+        p.lire_horaire_annee({})
+        attendre(p._chantier)
+        p.preparer_dossiers_annee()
+
+        # 1. Trouvés et montrés avec la matière : rôle, format, ancien format à convertir.
+        m = {x["court"]: x for x in p.etat_annee()["matieres"]}["Psychologie"]
+        docs = m["documents"]
+        assert [d["relatif"] for d in docs] == [
+            "Plan du cours.txt", "Syllabus Psychologie 2026-2027.docx", "Cours 1 - Attachement.pptx",
+            "Travail de groupe/Sources.txt", "Cours 0 - Introduction.ppt"], docs
+        assert [d["role"] for d in docs] == ["syllabus", "syllabus", "diapositives", "", ""]
+        assert [d["format"] for d in docs] == ["Notes", "Word", "PowerPoint", "Notes",
+                                               "PowerPoint ancien format"]
+        assert docs[3]["sous_dossier"] == "Travail de groupe"
+        assert [d["etat"] for d in docs] == ["nouveau"] * 4 + ["a_convertir"]
+        assert "Enregistrer sous" in docs[4]["conseil"] and not docs[0]["conseil"]
+        assert m["supports"] == 4 and m["a_convertir"] == 1
+
+        # 2. Tout traiter : le syllabus est remis à Claude en premier, annoncé comme
+        #    tel, pour les fiches comme pour les infos ; l'ancien format est signalé.
+        p.lancer_annee({"modele": "large-v3"})
+        attendre(p._chantier, 300)
+        assert p._chantier.etat == "fini", p._chantier.instantane()
+        assert any("Cours 0 - Introduction.ppt" in r and "Enregistrer sous" in r
+                   for r in p._chantier.remarques), p._chantier.remarques
+        fiches = [e for e in _entrees(tmp, "fiches").values() if "Syllabus Psychologie" in e]
+        infos = [e for e in _entrees(tmp, "infos").values() if "Syllabus Psychologie" in e]
+        assert len(fiches) == 1 and len(infos) == 1
+        for entree in fiches + infos:
+            assert tr.sup.CONSIGNE_ROLES in entree
+            assert ('<document type="syllabus — document Word" fichier="Syllabus Psychologie 2026-2027.docx">'
+                    in entree)
+            assert "Évaluation : examen écrit en janvier" in entree
+            assert (entree.index('fichier="Plan du cours.txt"')
+                    < entree.index('fichier="Syllabus Psychologie 2026-2027.docx"')
+                    < entree.index('<document type="diapositives" fichier="Cours 1 - Attachement.pptx">')
+                    < entree.index('fichier="Travail de groupe/Sources.txt"'))
+            assert "Cours 0 - Introduction" not in entree
+        m = {x["court"]: x for x in p.etat_annee()["matieres"]}["Psychologie"]
+        assert [d["etat"] for d in m["documents"]] == ["fiches"] * 4 + ["a_convertir"]
+        assert all(d["integre"] for d in m["documents"][:4])
+        assert m["a_jour"] and not m["docs_nouveaux"]
+        assert [(s["date"], s["etat"], len(s["audios"])) for s in m["detail_seances"]] == [
+            ("mar 08/09", "fiches", 2)]
+
+        # 3. Un PowerPoint arrive en cours d'année : seul lui est ajouté aux fiches.
+        _diapos(psy / "Cours 2 - Développement moral.pptx", "Kohlberg", "Les stades du jugement moral")
+        m = {x["court"]: x for x in p.etat_annee()["matieres"]}["Psychologie"]
+        etats = {d["nom"]: d["etat"] for d in m["documents"]}
+        assert etats["Cours 2 - Développement moral.pptx"] == "nouveau" and m["docs_nouveaux"] == 1
+        assert not m["a_jour"]
+        avant = set(_entrees(tmp, "fiches"))
+        p.lancer_annee({"modele": "large-v3"})
+        attendre(p._chantier, 300)
+        taches = {x["cle"]: x for x in p._chantier.instantane()["taches"]}
+        assert set(taches) == {"f:Psychologie", "i:Psychologie"}, taches
+        assert all(x["statut"] == "fait" for x in taches.values()), taches
+        assert taches["f:Psychologie"]["detail"].startswith("ajout"), taches["f:Psychologie"]
+        ajout = [e for n, e in _entrees(tmp, "fiches").items() if n not in avant]
+        assert len(ajout) == 1 and "Les stades du jugement moral" in ajout[0]
+        assert "La théorie de l'attachement" not in ajout[0]          # déjà dans les fiches
+        m = {x["court"]: x for x in p.etat_annee()["matieres"]}["Psychologie"]
+        assert {d["nom"]: d["etat"] for d in m["documents"]}["Cours 2 - Développement moral.pptx"] == "fiches"
+        assert m["a_jour"]
+
+        # 4. L'ancien format converti : il devient un support comme les autres.
+        (psy / "Cours 0 - Introduction.ppt").unlink()
+        _diapos(psy / "Cours 0 - Introduction.pptx", "Introduction", "Le développement tout au long de la vie")
+        m = {x["court"]: x for x in p.etat_annee()["matieres"]}["Psychologie"]
+        assert m["a_convertir"] == 0 and m["supports"] == 6
+        assert {d["nom"]: d["etat"] for d in m["documents"]}["Cours 0 - Introduction.pptx"] == "nouveau"
+        p.lancer_annee({"modele": "large-v3"})
+        attendre(p._chantier, 300)
+        assert not any("illisible" in r for r in p._chantier.remarques), p._chantier.remarques
+        assert {x["court"]: x for x in p.etat_annee()["matieres"]}["Psychologie"]["a_jour"]
+
+
 if __name__ == "__main__":
     test_annee_de_bout_en_bout()
     print("ok bout en bout")
@@ -371,3 +488,5 @@ if __name__ == "__main__":
     print("ok limite et arrêt")
     test_ajouts_rangement_et_reecriture()
     print("ok ajouts, rangement, réécriture")
+    test_supports_de_cours()
+    print("ok supports de cours")

@@ -27,9 +27,14 @@ def test_cours_seul():
         audio.write_bytes(b"\0" * 8192)
         notes = tmp / "mes notes.txt"
         notes.write_text("Notes personnelles : tri rapide, pivot.", encoding="utf-8")
+        syllabus = tmp / "Syllabus algorithmique.txt"
+        syllabus.write_text("Plan : tris, graphes. Examen écrit en juin.", encoding="utf-8")
         p = tr.Passerelle()
+        assert p._decrire_support(str(syllabus))["role"] == "syllabus"
+        assert p._decrire_support(str(notes))["role"] == ""
         r = p.lancer({"chemin": str(audio), "matiere": "Algorithmique", "termes": "QuickSort",
-                      "modele": "large-v3", "consignes": "Cours complet", "supports": [str(notes)]})
+                      "modele": "large-v3", "consignes": "Cours complet",
+                      "supports": [str(notes), str(syllabus)]})
         assert not r.get("erreur"), r
         fin = time.time() + 120
         while p._courant.etat == "en_cours" and time.time() < fin:
@@ -44,6 +49,11 @@ def test_cours_seul():
         assert txt.startswith("Cours : Algorithmique\nFichier : algo seance 4.mp3")
         assert not list(dossier.glob("*.partiel"))
         assert (dossier / "algo seance 4.md").is_file()
+        # Le syllabus est annoncé comme tel à Claude, avec ce qui fait foi.
+        entree = max((tmp / "env" / "local" / "Transcriptor" / "atelier").glob("cours-*/entree_claude.txt"),
+                     key=lambda f: f.stat().st_mtime).read_text("utf-8")
+        assert tr.sup.CONSIGNE_ROLES in entree and "— Syllabus (document de cours" in entree
+        assert '<document type="syllabus — notes" fichier="Syllabus algorithmique.txt">' in entree
         appel = json.loads((tmp / "env" / "appels_claude.jsonl").read_text("utf-8").splitlines()[-1])
         assert "-p" in appel["args"] and "--allowedTools" not in appel["args"]   # notes : pas de Read
 

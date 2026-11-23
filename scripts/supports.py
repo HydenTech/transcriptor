@@ -34,10 +34,22 @@ from typing import Any, Callable, Optional
 
 EXT_IMAGE = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff",
              ".heic", ".heif"}
-EXT_DIAPOS = {".pptx", ".pdf"}
+# Présentations au format PowerPoint actuel (diaporama .ppsx, avec macros…) :
+# même contenu qu'un .pptx, lues comme lui.
+EXT_PRESENTATIONS = {".pptx", ".ppsx", ".pptm", ".ppsm", ".potx"}
+EXT_DIAPOS = EXT_PRESENTATIONS | {".pdf"}
 EXT_NOTES = {".txt", ".md"}
-EXT_DOCUMENTS = {".docx"}
-EXT_SUPPORTS = EXT_IMAGE | EXT_DIAPOS | EXT_NOTES | EXT_DOCUMENTS | {".ppt"}
+EXT_DOCUMENTS = {".docx", ".docm", ".dotx"}
+# Trouvés et signalés, mais illisibles tels quels : (libellé, que faire).
+A_CONVERTIR = {
+    ".ppt": ("PowerPoint ancien format", "dans PowerPoint, « Enregistrer sous » .pptx (ou « Exporter » en PDF)"),
+    ".pps": ("PowerPoint ancien format", "dans PowerPoint, « Enregistrer sous » .pptx (ou « Exporter » en PDF)"),
+    ".doc": ("Word ancien format", "dans Word, « Enregistrer sous » .docx (ou en PDF)"),
+    ".rtf": ("document RTF", "dans Word, « Enregistrer sous » .docx (ou en PDF)"),
+    ".odt": ("document OpenDocument", "« Enregistrer sous » .docx (ou en PDF)"),
+    ".odp": ("présentation OpenDocument", "« Enregistrer sous » .pptx (ou en PDF)"),
+}
+EXT_SUPPORTS = EXT_IMAGE | EXT_DIAPOS | EXT_NOTES | EXT_DOCUMENTS | set(A_CONVERTIR)
 
 COTE_MAX = 1600            # px, plus grand côté des images envoyées
 IMAGES_PAR_PPTX = 40       # au-delà, on garde les plus grandes
@@ -75,10 +87,10 @@ def genre_de(chemin: Path) -> str:
     ext = chemin.suffix.lower()
     if ext in EXT_IMAGE:
         return "photo"
-    if ext == ".pptx":
+    if ext in EXT_PRESENTATIONS:
         return "diapos"
-    if ext == ".ppt":
-        return "ppt"
+    if ext in A_CONVERTIR:
+        return "a_convertir"
     if ext == ".pdf":
         return "pdf"
     if ext in EXT_NOTES:
@@ -169,9 +181,8 @@ def preparer(sources: list[Path], dossier: Path, *,
                 nouveaux = [_notes(src, dossier, prefixe)]
             elif genre == "document":
                 nouveaux = [_docx(src, dossier, prefixe, importer)]
-            elif genre == "ppt":
-                raise ValueError("ancien format PowerPoint illisible — dans PowerPoint, "
-                                 "« Enregistrer sous » .pptx ou « Exporter » en PDF, puis rajoute-le")
+            elif genre == "a_convertir":
+                raise ValueError(conversion(src))
             else:
                 raise ValueError(f"format {src.suffix or 'inconnu'} non pris en charge")
         except Exception as exc:  # noqa: BLE001
@@ -272,7 +283,8 @@ def _pdf(src: Path, dossier: Path, prefixe: str,
         pages = len(re.findall(rb"/Type\s*/Page(?![a-zA-Z])", src.read_bytes()))
     except Exception:  # noqa: BLE001
         pages = 0
-    support = Support(nom, "pdf", src.name, f"≈ {pages} pages" if pages else "")
+    support = Support(nom, "pdf", src.name,
+                      f"≈ {pages} page{'s' if pages > 1 else ''}" if pages else "")
     if importer is not None:
         # Texte extrait : bien moins coûteux à transmettre que le PDF lu page à
         # page. Un PDF scanné (presque pas de texte) reste à lire avec Read.
@@ -295,11 +307,48 @@ def _pdf(src: Path, dossier: Path, prefixe: str,
     return support
 
 
+def conversion(p: Path) -> str:
+    """Pour un format trouvé mais illisible : quoi en faire."""
+    libelle, quoi = A_CONVERTIR.get(p.suffix.lower(), (f"format {p.suffix or 'inconnu'}", "convertis-le en PDF"))
+    return f"{libelle} illisible tel quel — {quoi}, puis remets-le dans le dossier"
+
+
+# Partie principale d'un paquet Office : python-pptx et python-docx n'ouvrent
+# que la variante « document » ; un diaporama .ppsx, un .pptm, un modèle…
+# ont le même contenu sous un autre type, qu'il suffit de renommer.
+_TYPES_PRINCIPAUX = {
+    "/ppt/presentation.xml": "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+    "/word/document.xml": "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+}
+
+
+def _ooxml_standard(src: Path) -> io.BytesIO:
+    """Copie en mémoire du paquet, avec le type standard pour sa partie principale."""
+    import zipfile
+    sortie = io.BytesIO()
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(sortie, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "[Content_Types].xml":
+                texte = data.decode("utf-8")
+                for partie, type_ in _TYPES_PRINCIPAUX.items():
+                    texte = re.sub(rf'(<Override\s+PartName="{re.escape(partie)}"\s+ContentType=")[^"]+(")',
+                                   rf"\g<1>{type_}\g<2>", texte)
+                data = texte.encode("utf-8")
+            zout.writestr(item, data)
+    sortie.seek(0)
+    return sortie
+
+
+def _ouvrir_office(src: Path, ouvrir: Callable[[Any], Any], standard: str) -> Any:
+    return ouvrir(str(src) if src.suffix.lower() == standard else _ooxml_standard(src))
+
+
 def _docx(src: Path, dossier: Path, prefixe: str, importer: Importeur) -> Support:
     """Document Word : texte des paragraphes (titres repérés) et des tableaux."""
     docx = importer("docx", "python-docx")
     try:
-        doc = docx.Document(str(src))
+        doc = _ouvrir_office(src, docx.Document, ".docx")
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"document Word illisible ({exc})") from exc
     lignes = [f"# Document — {src.name}", ""]
@@ -347,7 +396,7 @@ def _pptx(src: Path, dossier: Path, prefixe: str, importer: Importeur,
           avert: list[str]) -> list[Support]:
     pptx = importer("pptx", "python-pptx")
     try:
-        prs = pptx.Presentation(str(src))
+        prs = _ouvrir_office(src, pptx.Presentation, ".pptx")
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"présentation illisible ({exc})") from exc
 
@@ -468,6 +517,55 @@ def vocabulaire(supports: list[Support], dossier: Path, limite: int = 600) -> st
     return texte
 
 
+# Repérés d'après le nom du fichier (minuscules, sans accents). « _ » compte
+# comme séparateur : « Fiche_UE_2 », « DIP_UE13 ».
+_RE_SYLLABUS = re.compile(
+    r"syllabus|(?<![a-z0-9])(dip|ects)(?![a-z0-9])|intentions?[\s_-]+pedagogiques?|"
+    r"dossier[\s_-]+pedagogique|fiche[\s_-]*(d[\s_'-]*)?(ue|cours|aa|activite)(?![a-z0-9])|descriptif|"
+    r"plan[\s_-]+(du|de)[\s_-]+cours|programme[\s_-]+(du|de)[\s_-]+cours|"
+    r"guide[\s_-]+(du|de)[\s_-]+cours|description[\s_-]+(du|de)[\s_-]+cours|"
+    r"modalites[\s_-]+(d[\s_'-]*)?(evaluation|examen)|engagement[\s_-]+pedagogique|"
+    r"consignes?[\s_-]+(d[\s_'-]*)?(examen|evaluation)")
+# Notes de cours de l'enseignant (le « syllabus » au sens belge) : rangées avec
+# le syllabus, sauf une présentation PowerPoint, qui reste des diapositives.
+_RE_NOTES_COURS = re.compile(
+    r"notes?[\s_-]+de[\s_-]+cours|cours[\s_-]+(complet|imprimable|redige|ecrit)|polycopie|"
+    r"support[\s_-]+(du|de)[\s_-]+cours")
+_RE_DIAPOS_PDF = re.compile(r"diapo|slide|powerpoint|(?<![a-z0-9])ppt(?![a-z0-9])|presentation")
+
+
+def _plat(texte: str) -> str:
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFD", texte)
+                   if not unicodedata.combining(c)).lower().replace("’", "'")
+
+
+def role_document(nom: str, genre: str = "") -> str:
+    """« syllabus » (syllabus, notes de cours, fiche UE, DIP, plan de cours,
+    modalités d'évaluation…), « diapositives » (PowerPoint, ou PDF dont le nom
+    le dit) ou « » ; d'après le nom du fichier."""
+    plat = _plat(nom)
+    if _RE_SYLLABUS.search(plat):
+        return "syllabus"
+    genre = genre or genre_de(Path(nom))
+    if genre == "diapos":
+        return "diapositives"
+    if _RE_NOTES_COURS.search(plat):
+        return "syllabus"
+    if genre == "pdf" and _RE_DIAPOS_PDF.search(plat):
+        return "diapositives"
+    return ""
+
+
+def libelle_format(p: Path) -> str:
+    """« PowerPoint », « PDF », « Word », « Notes », « Photo », « PowerPoint ancien format »…"""
+    ext = p.suffix.lower()
+    if ext in A_CONVERTIR:
+        return A_CONVERTIR[ext][0][0].upper() + A_CONVERTIR[ext][0][1:]
+    return {"diapos": "PowerPoint", "pdf": "PDF", "document": "Word", "notes": "Notes",
+            "photo": "Photo"}.get(genre_de(p), ext.lstrip(".").upper())
+
+
 def a_lire(supports: list[Support]) -> list[Support]:
     """Ceux que Claude doit lire avec l'outil Read : un PDF dont le texte a
     été extrait n'en fait plus partie."""
@@ -489,11 +587,23 @@ def _situer(prise: str, debut: Optional[datetime.datetime], duree: float) -> str
     return f" · prise vers [{s // 3600:02d}:{(s % 3600) // 60:02d}] de l'enregistrement (estimation)"
 
 
+ROLES = {"syllabus": "syllabus (document de cours de l'enseignant : plan, objectifs, contenu, "
+                     "modalités d'évaluation)",
+         "diapositives": "diapositives de l'enseignant"}
+CONSIGNE_ROLES = ("Un syllabus (notes de cours ou plan de cours de l'enseignant, fiche UE, DIP) donne "
+                  "la structure officielle du cours, ses objectifs et souvent ses modalités "
+                  "d'évaluation : appuie ton plan sur le sien, reprends ses définitions, et ses "
+                  "modalités d'évaluation avec les informations pratiques. Les diapositives de "
+                  "l'enseignant font foi pour les termes, les définitions et les schémas ; ce qui a "
+                  "été dit en séance les complète (exemples, explications, insistances).")
+
+
 def bloc_pour_claude(supports: list[Support], dossier: Path, *,
                      debut: Optional[datetime.datetime] = None, duree: float = 0,
                      racine: Optional[Path] = None, budget: Optional[int] = None,
                      chemins: Optional[dict[str, str]] = None,
-                     intro: str = "Supports fournis avec l'enregistrement") -> str:
+                     intro: str = "Supports fournis avec l'enregistrement",
+                     roles: Optional[dict[str, str]] = None) -> str:
     """Le bloc <supports> placé dans l'entrée de Claude : la liste des
     fichiers à lire, et le texte des diapositives et notes en clair.
 
@@ -504,14 +614,19 @@ def bloc_pour_claude(supports: list[Support], dossier: Path, *,
     if not supports:
         return ""
     chemins = chemins or {}
+    roles = roles or {}
     lignes = ["<supports>",
               f"{intro}, dans le dossier supports/ du "
               "répertoire courant" + (f" (chemin complet : {racine})" if racine else "")
               + ". Les photos, images et PDF sont à lire avec l'outil Read ; "
-              "le texte des diapositives et des notes est reproduit plus bas.", ""]
+              "le texte des diapositives et des notes est reproduit plus bas."]
+    if any(roles.get(s.origine) for s in supports):
+        lignes.append(CONSIGNE_ROLES)
+    lignes.append("")
     photos = 0
     for s in supports:
         chemin = f"supports/{s.fichier}"
+        avant = len(lignes)
         if s.genre == "photo":
             photos += 1
             quand = ""
@@ -535,6 +650,10 @@ def bloc_pour_claude(supports: list[Support], dossier: Path, *,
             lignes.append(f"- {chemin} — image de la diapositive {s.diapo} de « {s.origine} »")
         elif s.genre == "notes":
             lignes.append(f"- {chemin} — notes « {s.origine} » (reproduites ci-dessous)")
+        role = roles.get(s.origine)
+        if role and len(lignes) > avant and s.genre != "image_diapo":
+            texte_role = ROLES.get(role, role)
+            lignes[-1] = lignes[-1].replace(" — ", f" — {texte_role[0].upper()}{texte_role[1:]} : ", 1)
 
     reste = budget
     omis: list[str] = []
@@ -556,6 +675,8 @@ def bloc_pour_claude(supports: list[Support], dossier: Path, *,
             reste -= len(texte)
         genre = {"diapos": "diapositives", "notes": "notes", "document": "document Word",
                  "pdf": "texte d'un PDF"}[s.genre]
+        if roles.get(s.origine) == "syllabus":
+            genre = "syllabus — " + genre
         lignes += ["", f'<document type="{genre}" fichier="{chemins.get(s.origine, s.origine)}">',
                    texte.strip(), "</document>"]
     if omis:

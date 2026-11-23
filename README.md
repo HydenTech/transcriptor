@@ -179,10 +179,17 @@ prépare en local avant la transcription.
 
 | Support | Préparation | Ce que Claude en fait |
 |---|---|---|
-| `.pptx` | texte de chaque diapo, **notes de l'orateur**, images (sans les logos répétés) | lit le texte, regarde les images |
+| `.pptx` (et `.ppsx`, `.pptm`) | texte de chaque diapo, **notes de l'orateur**, images (sans les logos répétés) | lit le texte, regarde les images |
 | `.pdf` | copié tel quel | le lit en entier, texte et visuel |
+| `.docx` (et `.docm`) | texte des paragraphes et des tableaux | le lit avec la transcription |
 | Photos JPG, PNG, HEIC | redressées (EXIF), réduites à 1600 px, rangées par heure de prise de vue | les regarde, peut les insérer dans le support |
 | `.txt`, `.md` | tels quels | tes notes, lues avec la transcription |
+
+Un document dont le nom dit que c'est un **syllabus** (syllabus, notes de
+cours, cours imprimable, fiche UE ou ECTS, DIP, plan du cours, modalités
+d'évaluation…) est marqué `syllabus` dans la liste et annoncé comme tel à
+Claude, qui appuie son plan et ses définitions dessus ; les diapositives de
+l'enseignant font foi pour les termes et les schémas.
 
 La corrélation se fait à deux moments :
 
@@ -196,7 +203,8 @@ La corrélation se fait à deux moments :
   la porte, aide à la situer dans le cours. Les règles de croisement sont dans
   le modèle de consignes (partie *Supports du cours*) : modifiables comme le reste.
 
-Un `.ppt` (ancien format) n'est pas lisible : dans PowerPoint, **Enregistrer
+Un `.ppt` (ancien format) n'est pas lisible — pas plus qu'un `.doc`, `.rtf`,
+`.odt` ou `.odp` : il est signalé avec quoi faire. Dans PowerPoint, **Enregistrer
 sous** `.pptx`, ou **Exporter** en PDF — le PDF garde la mise en page exacte des
 diapos. Au premier support, l'app installe si besoin ce qu'il lui faut
 (python-pptx, Pillow, pillow-heif) : il faut être connecté.
@@ -304,15 +312,41 @@ matière sans enregistrement mais avec des documents est marquée *supports
 seuls* : **Rédiger** crée ses fiches à partir des documents seuls ; « Tout
 traiter » suit ensuite ses nouveaux documents.
 
-### Les documents de la matière
+### Les documents de la matière (syllabus, PowerPoint…)
 
 Tout ce qui est rangé dans le dossier d'une matière, sous-dossiers compris,
-nourrit ses fiches : PDF, `.pptx`, `.docx`, `.txt`, `.md`, photos. Le texte des
-PDF et des Word est extrait sur le PC et donné à Claude ; il ouvre lui-même les
-images et les PDF sans texte. Sont ignorés : `_Transcriptor`, les fichiers
-temporaires de Word (`~$…`) et les Word produits par l'app. **Tout ce qui est
-dans le dossier d'une matière est envoyé à Claude** : n'y range que ce qui
-concerne le cours.
+nourrit ses fiches et ses infos : PDF, PowerPoint (`.pptx`, `.ppsx`, `.pptm`),
+Word (`.docx`, `.docm`), `.txt`, `.md`, photos. Le texte des PDF, des Word et
+des diapos est extrait sur le PC et donné à Claude ; il ouvre lui-même les
+images et les PDF sans texte.
+
+- **Le syllabus d'abord.** Un document dont le nom dit que c'est un syllabus
+  (syllabus, notes de cours, cours imprimable, fiche UE ou ECTS, DIP, document
+  d'intentions pédagogiques, plan du cours, modalités d'évaluation…) est remis
+  en premier et annoncé comme tel : Claude appuie le plan des fiches et les
+  définitions dessus, et reprend ses modalités d'évaluation dans les infos.
+  Viennent ensuite les **diapositives** (PowerPoint, ou PDF dont le nom dit
+  « diapo », « présentation »…), qui font foi pour les termes et les schémas,
+  puis le reste ; la racine du dossier avant les sous-dossiers. Le volume de
+  texte donné à Claude est borné : en cas de trop-plein, ce sont les derniers
+  qui sont seulement listés (Claude peut encore les ouvrir).
+- **Dans l'app**, chaque matière a une ligne **Supports** : les documents
+  trouvés, avec `Syllabus` ou `Diapos` devant leur nom (clic : ouvre le
+  fichier). **Détails** déplie la matière : ses supports (rôle, format, taille,
+  ✓ dans les fiches depuis le…, *nouveau*, ou *à convertir* avec quoi faire) et
+  ses séances enregistrées (date, audios, état).
+- **En cours d'année**, un document ajouté ou modifié est marqué *nouveau* et
+  ajouté aux fiches au prochain « Tout traiter », sans relire le reste.
+- **Anciens formats** (`.ppt`, `.pps`, `.doc`, `.rtf`, `.odt`, `.odp`) :
+  trouvés mais illisibles tels quels, ils sont marqués *à convertir* (en rouge)
+  et rappelés dans le bilan. Dans PowerPoint ou Word, **Enregistrer sous**
+  `.pptx` / `.docx` (ou en PDF) dans le même dossier : la copie convertie est
+  lue au passage suivant.
+
+Sont ignorés : `_Transcriptor`, les fichiers temporaires de Word (`~$…`), les
+Word produits par l'app, et les documents posés à la racine de l'année (hors
+dossier de matière). **Tout ce qui est dans le dossier d'une matière est envoyé
+à Claude** : n'y range que ce qui concerne le cours.
 
 ### Les Word
 
@@ -379,9 +413,10 @@ synthèse** : rien n'est à retranscrire.
 plus rien envoyé pendant 20 minutes (réseau, service surchargé). Relance-la.
 Le plafond absolu est de deux heures.
 
-**Un support est « ignoré »** — la raison s'affiche sous les étapes (`.ppt`
-ancien format, fichier vide, photo HEIC sans pillow-heif installable…). Le cours
-continue sans lui.
+**Un support est « ignoré » ou « à convertir »** — la raison s'affiche sous
+les étapes ou dans le bilan (`.ppt`/`.doc` ancien format, fichier vide, photo
+HEIC sans pillow-heif installable…). Le cours continue sans lui. Pour un ancien
+format : **Enregistrer sous** `.pptx` / `.docx` (ou en PDF).
 
 **Le PDF ne suit pas mes réglages** — un réglage mal écrit est signalé sous la
 liste des consignes et sous les étapes, puis remplacé par sa valeur par défaut.

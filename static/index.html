@@ -169,9 +169,11 @@ ul.fichiers li:first-child{border-top:none}
 .genre[data-g="photo"]{background:#FFE3EE}
 .genre[data-g="diapos"],.genre[data-g="pdf"]{background:#DDF4F6}
 .genre[data-g="notes"]{background:#F4F9C8}
+.genre[data-g="syllabus"]{background:#EDE3F6;color:#5B3C85}
 ul.fichiers .nom{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 ul.fichiers .poids{font-family:var(--mono);font-size:11.5px;color:var(--ink-2)}
 ul.fichiers .ko{color:var(--red);font-size:12.5px}
+ul.fichiers .nom .ko{display:block;white-space:normal;font-size:12px;margin-top:2px}
 .retirer{border:none;background:none;color:var(--ink-2);font-size:17px;line-height:1;
   cursor:pointer;padding:0 4px}
 .retirer:hover{color:var(--red)}
@@ -329,6 +331,45 @@ ul.audios > li.a-sep:first-child{border-top:none;padding-top:0}
 .case{display:flex;align-items:center;gap:8px;font-size:13px;margin-top:10px;cursor:pointer}
 .case input{width:16px;height:16px;margin:0;accent-color:var(--ink)}
 .m-actions .mini.confirmer{border-color:var(--red);color:var(--red)}
+/* Supports de cours trouvés dans le dossier de la matière */
+.m-supports{grid-column:2/-1;display:flex;flex-wrap:wrap;gap:4px 6px;align-items:center;font-size:12px;
+  min-width:0}
+.m-supports .lab{font-family:var(--mono);font-size:10px;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--ink-2);margin-right:2px}
+.m-supports .doc{border:1px solid var(--rule);border-radius:2px;padding:1px 7px;max-width:280px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:#fff;color:var(--ink);font:inherit;
+  font-size:12px;cursor:pointer;text-align:left}
+.m-supports .doc:hover{border-color:var(--ink)}
+.m-supports .doc b{font-weight:600}
+.m-supports .doc.ko{border-color:#F0B7AE;color:var(--red)}
+.m-supports .aucun{color:var(--ink-2);font-style:italic}
+.m-supports .plus{border:none;background:none;padding:0 2px;color:var(--ink-2);font-family:var(--mono);
+  font-size:11px;cursor:pointer;text-decoration:underline dotted}
+.m-supports .plus:hover{color:var(--ink)}
+.m-details{grid-column:2/-1;border-left:2px solid var(--rule);padding:2px 0 4px 12px;margin-top:2px}
+.m-details h4{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--ink-2);font-weight:400;margin:8px 0 2px}
+.m-details h4:first-child{margin-top:2px}
+.m-details table{width:100%;border-collapse:collapse;font-size:12.5px;table-layout:fixed}
+.m-details td{padding:5px 10px 5px 0;border-top:1px dashed var(--rule-2);vertical-align:top;
+  overflow:hidden;text-overflow:ellipsis}
+.m-details tr:first-child td{border-top:none}
+.m-details td.quoi{width:118px;font-family:var(--mono);font-size:11px;color:var(--ink-2);overflow-wrap:anywhere}
+.m-details td.quoi .role{display:table;margin-bottom:3px}
+.m-details td.quand{white-space:nowrap}
+.m-details td.etat{width:190px;font-family:var(--mono);font-size:11px;color:var(--ink-2)}
+.m-details td.etat.ok{color:#2E7D32}
+.m-details td.etat.ko{color:var(--red)}
+.m-details td.etat.neuf b{font-weight:500;font-size:10px;letter-spacing:.05em;text-transform:uppercase;
+  background:#F4F9C8;color:#5F5E10;border-radius:9px;padding:1px 7px}
+.m-details .role{display:inline-block;font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;
+  text-transform:uppercase;border-radius:2px;padding:0 5px;margin-right:6px;background:#EEF1E8;color:var(--ink-2)}
+.m-details .role[data-r="syllabus"]{background:#EDE3F6;color:#5B3C85}
+.m-details .lien{border:none;background:none;padding:0;font:inherit;color:var(--ink);cursor:pointer;
+  text-align:left;text-decoration:underline;text-decoration-color:var(--rule);text-underline-offset:2px}
+.m-details .lien:hover{text-decoration-color:var(--ink)}
+.m-details small{display:block;color:var(--ink-2);font-size:11px;white-space:normal}
+.m-details .vide-d{color:var(--ink-2);font-style:italic;font-size:12.5px;margin:2px 0 4px}
 .barre{height:3px;background:var(--rule-2);border-radius:2px;overflow:hidden;margin-top:4px}
 .barre i{display:block;height:100%;background:var(--ink);width:0;transition:width .4s}
 
@@ -839,7 +880,7 @@ function decrireClaude(c) {
 }
 
 /* ---------- supports du cours ---------- */
-const GENRES = {photo:"photo", diapos:"pptx", pdf:"pdf", notes:"notes", ppt:"ppt", document:"docx"};
+const GENRES = {photo:"photo", diapos:"pptx", pdf:"pdf", notes:"notes", document:"docx"};
 $("#ajouter-supports").addEventListener("click", async () => {
   if (!api) return;
   try {
@@ -852,10 +893,13 @@ $("#ajouter-supports").addEventListener("click", async () => {
 });
 function afficherSupports() {
   $("#liste-supports").innerHTML = supports.map((f, i) => `
-    <li><span class="genre" data-g="${echapper(f.genre || "")}">${echapper(GENRES[f.genre] || "?")}</span>
-      <span class="nom" title="${echapper(f.chemin)}">${echapper(f.nom)}</span>
-      ${f.erreur ? `<span class="ko">${echapper(f.erreur)}</span>`
-                 : `<span class="poids">${echapper(f.taille || "")}</span>`}
+    <li>${f.role === "syllabus"
+        ? `<span class="genre" data-g="syllabus" title="Syllabus : Claude appuie le plan et les définitions sur lui">syllabus</span>`
+        : `<span class="genre" data-g="${echapper(f.genre || "")}">${echapper(GENRES[f.genre]
+        || (f.nom.includes(".") ? f.nom.split(".").pop().toLowerCase() : "?"))}</span>`}
+      <span class="nom" title="${echapper(f.chemin)}">${echapper(f.nom)}${f.erreur
+        ? `<small class="ko">${echapper(f.erreur)}</small>` : ""}</span>
+      <span class="poids">${f.erreur ? "" : echapper(f.taille || "")}</span>
       <button class="retirer" data-i="${i}" title="Retirer" type="button">×</button></li>`).join("");
   document.querySelectorAll(".retirer").forEach(b => b.addEventListener("click", () => {
     supports.splice(+b.dataset.i, 1);
@@ -1287,7 +1331,8 @@ function afficherMatieres() {
   $("#a-panel-matieres").hidden = !mats.length;
   // Une matière sans enregistrement, sans support ni fiche n'a rien à montrer :
   // elle rejoint la ligne compacte du bas (un clic ouvre son dossier).
-  const vide = (m) => !m.seances && !m.supports && !m.fiches && !m.infos && !tachesDe(m.nom).length;
+  const vide = (m) => !m.seances && !m.supports && !m.a_convertir && !m.fiches && !m.infos
+    && !tachesDe(m.nom).length;
   const pleines = mats.map((m, i) => [m, i]).filter(([m]) => !vide(m));
   const vides = mats.map((m, i) => [m, i]).filter(([m]) => vide(m));
   $("#a-matieres").innerHTML = pleines.map(([m, i]) => {
@@ -1325,6 +1370,7 @@ function afficherMatieres() {
       + "Plus long : utile quand le plan s'est déformé à force d'ajouts, par exemple avant les examens."
       + (m.ajouts ? ` ${pluriel(m.ajouts, "ajout")} depuis la dernière rédaction complète`
                     + (m.complet ? ` (${m.complet.split("-").reverse().join("/")})` : "") + "." : "");
+    const ouverte = matieresOuvertes.has(m.nom);
     return `<li>
       <span class="puce" style="background:${m.couleur}"></span>
       <div style="min-width:0"><div class="m-nom" title="${echapper(m.nom)}">${echapper(m.court)}</div>
@@ -1344,8 +1390,12 @@ function afficherMatieres() {
                ? "Confirmer la réécriture ?" : "Tout réécrire"}</button>`
           : `<button class="mini" data-i="${i}" data-act="rediger" type="button" ${peutRefaire ? "" : "disabled"}
                title="Rédiger les fiches et les infos de cette matière">Rédiger</button>`}
+        <button class="mini" data-i="${i}" data-act="details" type="button"
+                title="Supports de cours et séances enregistrées de cette matière">Détails ${ouverte ? "▾" : "▸"}</button>
         <span class="detail" data-e="${etat}" title="${echapper(detail)}">${echapper(detail)}</span>
-      </div></li>`;
+      </div>
+      ${ligneSupports(m, i)}
+      ${ouverte ? detailsMatiere(m, i) : ""}</li>`;
   }).join("") + (vides.length ? `<li class="sans"><p class="sans-titre">Pas encore d'enregistrement ni de
       support · ${vides.length}</p><div class="sans-liste">${vides.map(([m, i]) =>
       `<button type="button" data-i="${i}" data-act="dossier" title="${echapper(m.nom)} — ouvrir son dossier">
@@ -1355,6 +1405,11 @@ function afficherMatieres() {
     if (b.dataset.act === "fiches" && m.fiches) api.ouvrir_annee_chemin(m.fiches.chemin);
     if (b.dataset.act === "infos" && m.infos) api.ouvrir_annee_chemin(m.infos.chemin);
     if (b.dataset.act === "dossier") api.ouvrir_annee_chemin(m.chemin);
+    if (b.dataset.act === "doc" && b.dataset.chemin) api.ouvrir_annee_chemin(b.dataset.chemin);
+    if (b.dataset.act === "details") {
+      if (matieresOuvertes.has(m.nom)) matieresOuvertes.delete(m.nom); else matieresOuvertes.add(m.nom);
+      afficherMatieres();
+    }
     if (b.dataset.act === "rediger") lancer(() => api.lancer_annee(optionsAnnee({matieres: [m.nom]})));
     if (b.dataset.act === "reecrire") {
       // Deux clics : la réécriture relit tout et prend du temps.
@@ -1371,6 +1426,68 @@ function afficherMatieres() {
   }));
 }
 let confirmation = null;          // « Tout réécrire » cliqué une fois : {nom, jusqua}
+const matieresOuvertes = new Set();   // matières dont les détails sont dépliés
+const ROLES_DOC = {syllabus: "Syllabus", diapositives: "Diapos"};
+
+// Les supports de cours trouvés dans le dossier de la matière, en une ligne :
+// on voit d'un coup d'œil qu'il y en a, lesquels, et s'il faut en convertir.
+function ligneSupports(m, i) {
+  const docs = m.documents || [];
+  if (!docs.length) {
+    return `<div class="m-supports"><span class="lab">Supports</span>
+      <span class="aucun">aucun dans « ${echapper(m.dossier)} » — syllabus, PowerPoint, PDF… y seront lus</span></div>`;
+  }
+  // Les documents à convertir demandent une action : toujours visibles.
+  const lisibles = docs.filter(d => d.etat !== "a_convertir");
+  const montres = lisibles.slice(0, 4).concat(docs.filter(d => d.etat === "a_convertir"));
+  const caches = docs.length - montres.length;
+  return `<div class="m-supports"><span class="lab">Supports</span>${montres.map(d => {
+    const titre = `${d.relatif} — ${d.format}${d.taille ? " · " + d.taille : ""} — `
+      + (d.etat === "fiches" ? `dans les fiches (${d.integre})`
+         : d.etat === "a_convertir" ? d.conseil : "nouveau : lu à la prochaine rédaction");
+    return `<button class="doc${d.etat === "a_convertir" ? " ko" : ""}" type="button" data-i="${i}" data-act="doc"
+      data-chemin="${echapper(d.chemin)}" title="${echapper(titre)}">${d.role
+        ? `<b>${ROLES_DOC[d.role] || d.role}</b> · ` : ""}${echapper(d.nom)}${d.etat === "a_convertir"
+        ? " (à convertir)" : ""}</button>`;
+  }).join("")}${caches ? `<button class="plus" type="button" data-i="${i}" data-act="details"
+      title="Voir tous les supports">+${caches}</button>` : ""}</div>`;
+}
+
+function detailsMatiere(m, i) {
+  const docs = m.documents || [];
+  const seances = m.detail_seances || [];
+  const aConvertir = docs.filter(d => d.etat === "a_convertir").length;
+  const ligneDoc = (d) => {
+    const etat = d.etat === "fiches" ? ["ok", `✓ dans les fiches · ${d.integre}`]
+      : d.etat === "a_convertir" ? ["ko", "à convertir"]
+      : ["neuf", m.fiches ? "<b>nouveau</b> · ajouté au prochain « Tout traiter »" : "<b>nouveau</b> · lu à la rédaction"];
+    return `<tr><td class="quoi">${d.role ? `<span class="role" data-r="${d.role}">${ROLES_DOC[d.role] || d.role}</span>` : ""}${
+        echapper(d.format)}</td>
+      <td><button class="lien" type="button" data-i="${i}" data-act="doc" data-chemin="${echapper(d.chemin)}"
+        title="Ouvrir ${echapper(d.relatif)}">${echapper(d.nom)}</button>${d.sous_dossier
+        ? `<small>dans « ${echapper(d.sous_dossier)} »</small>` : ""}${d.conseil
+        ? `<small>${echapper(d.conseil)}</small>` : ""}</td>
+      <td class="etat ${etat[0]}">${etat[1]}${d.taille ? `<small>${echapper(d.taille)}</small>` : ""}</td></tr>`;
+  };
+  const ligneSeance = (s) => {
+    const etat = {fiches: ["ok", `✓ dans les fiches · ${s.integre}`], notes: ["", "notes faites · à ajouter"],
+                  transcrit: ["", "transcrit"], nouveau: ["neuf", "<b>nouveau</b>"]}[s.etat] || ["", ""];
+    return `<tr><td class="quoi quand">${echapper(s.date || "sans date")}${s.heure ? " " + s.heure : ""}</td>
+      <td>${s.audios.map(a => `<span title="${echapper(a.nom)}">${echapper(a.titre)}</span>${
+        a.duree ? ` <small style="display:inline">· ${echapper(a.duree)}</small>` : ""}`).join("<br>")}</td>
+      <td class="etat ${etat[0]}">${etat[1]}</td></tr>`;
+  };
+  return `<div class="m-details">
+    <h4>Supports de cours · ${aConvertir ? `${pluriel(docs.length - aConvertir, "lisible")} · ${aConvertir} à convertir`
+      : docs.length}</h4>
+    ${docs.length ? `<table>${docs.map(ligneDoc).join("")}</table>`
+      : `<p class="vide-d">Aucun : dépose le syllabus, les PowerPoint ou les PDF du cours dans
+         « ${echapper(m.dossier)} » ; ils seront lus avec les enregistrements.</p>`}
+    <h4>Séances enregistrées · ${seances.length}</h4>
+    ${seances.length ? `<table>${seances.map(ligneSeance).join("")}</table>`
+      : `<p class="vide-d">Aucune pour l'instant.</p>`}
+  </div>`;
+}
 function pluriel(n, un, plusieurs) {
   return `${n} ${n > 1 ? (plusieurs || un + "s") : un}`;
 }
