@@ -11,7 +11,9 @@ Ils sont préparés en local dans <dossier du cours>/supports/, puis transmis
   photo dans l'enregistrement ; HEIC accepté grâce à pillow-heif ;
 - PPTX : texte de chaque diapositive et notes de l'orateur dans un .md,
   images des diapositives extraites (logos répétés et vignettes écartés) ;
-- PDF : copié tel quel, Claude le lit lui-même (texte et visuel) ;
+- PDF : copié tel quel, Claude le lit lui-même (texte et visuel) ; en mode
+  année, son texte est aussi extrait (moins coûteux à transmettre) ;
+- DOCX : texte et tableaux extraits (documents Word de Moodle, de stage…) ;
 - TXT/MD : notes personnelles, transmises telles quelles.
 
 Le manifeste (supports/manifeste.json) permet de relancer la synthèse sans
@@ -34,7 +36,8 @@ EXT_IMAGE = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff",
              ".heic", ".heif"}
 EXT_DIAPOS = {".pptx", ".pdf"}
 EXT_NOTES = {".txt", ".md"}
-EXT_SUPPORTS = EXT_IMAGE | EXT_DIAPOS | EXT_NOTES | {".ppt"}
+EXT_DOCUMENTS = {".docx"}
+EXT_SUPPORTS = EXT_IMAGE | EXT_DIAPOS | EXT_NOTES | EXT_DOCUMENTS | {".ppt"}
 
 COTE_MAX = 1600            # px, plus grand côté des images envoyées
 IMAGES_PAR_PPTX = 40       # au-delà, on garde les plus grandes
@@ -46,12 +49,14 @@ LISIBLES_PAR_CLAUDE = ("photo", "image_diapo", "pdf")   # à lire avec l'outil R
 @dataclass
 class Support:
     fichier: str                 # nom dans supports/
-    genre: str                   # photo | pdf | diapos | image_diapo | notes
+    genre: str                   # photo | pdf | diapos | image_diapo | notes | document
     origine: str                 # nom du fichier fourni
     detail: str = ""             # « 1600×1200 », « ≈ 34 pages », « 28 diapositives »
     prise: str = ""              # photo : « AAAA-MM-JJ HH:MM:SS » (EXIF)
     diapo: int = 0               # image_diapo : numéro de la diapositive
     source: str = ""             # chemin d'origine, pour ne pas préparer deux fois
+    texte: str = ""              # pdf : fichier du texte extrait (mode année)
+    empreinte: str = ""          # taille et date du fichier d'origine
 
     @classmethod
     def depuis(cls, d: dict) -> "Support":
@@ -78,6 +83,8 @@ def genre_de(chemin: Path) -> str:
         return "pdf"
     if ext in EXT_NOTES:
         return "notes"
+    if ext in EXT_DOCUMENTS:
+        return "document"
     return ""
 
 
@@ -108,14 +115,32 @@ def ecrire_manifeste(dossier: Path, supports: list[Support]) -> None:
 # ----------------------------------------------------------------------
 # Préparation
 # ----------------------------------------------------------------------
+def _empreinte(p: Path) -> str:
+    try:
+        st = p.stat()
+        return f"{st.st_size}-{int(st.st_mtime)}"
+    except OSError:
+        return ""
+
+
 def preparer(sources: list[Path], dossier: Path, *,
              importer: Importeur = _importer_simple,
-             signaler: Optional[Callable[[str], None]] = None) -> tuple[list[Support], list[str]]:
+             signaler: Optional[Callable[[str], None]] = None,
+             extraire_texte: bool = False,
+             oublier_absents: bool = False) -> tuple[list[Support], list[str]]:
     """Prépare les fichiers `sources` dans `dossier` (le sous-dossier
     supports/ du cours) et renvoie (tous les supports, avertissements).
-    Les supports déjà préparés lors d'un passage précédent sont conservés."""
+    Les supports déjà préparés lors d'un passage précédent sont conservés.
+
+    Mode année : `extraire_texte` extrait aussi le texte des PDF ;
+    `oublier_absents` retire du manifeste les supports dont le fichier
+    d'origine n'est plus dans `sources` ou a changé depuis (il est refait)."""
     dossier.mkdir(parents=True, exist_ok=True)
     supports = lire_manifeste(dossier)
+    if oublier_absents:
+        voulus = {str(Path(p).resolve()): _empreinte(Path(p)) for p in sources}
+        supports = [s for s in supports if s.source in voulus
+                    and (not s.empreinte or s.empreinte == voulus[s.source])]
     deja = {s.source for s in supports if s.source}
     avert: list[str] = []
     rang = 1 + max((int(m.group(1)) for s in supports
@@ -139,9 +164,11 @@ def preparer(sources: list[Path], dossier: Path, *,
             elif genre == "diapos":
                 nouveaux = _pptx(src, dossier, prefixe, importer, avert)
             elif genre == "pdf":
-                nouveaux = [_pdf(src, dossier, prefixe)]
+                nouveaux = [_pdf(src, dossier, prefixe, importer if extraire_texte else None)]
             elif genre == "notes":
                 nouveaux = [_notes(src, dossier, prefixe)]
+            elif genre == "document":
+                nouveaux = [_docx(src, dossier, prefixe, importer)]
             elif genre == "ppt":
                 raise ValueError("ancien format PowerPoint illisible — dans PowerPoint, "
                                  "« Enregistrer sous » .pptx ou « Exporter » en PDF, puis rajoute-le")
@@ -152,6 +179,7 @@ def preparer(sources: list[Path], dossier: Path, *,
             continue
         for s in nouveaux:
             s.source = str(src.resolve())
+            s.empreinte = _empreinte(src)
         supports.extend(nouveaux)
         rang += 1
 
@@ -236,14 +264,62 @@ def _photo(src: Path, dossier: Path, prefixe: str, importer: Importeur) -> Suppo
     return Support(nom, "photo", src.name, taille, prise=prise)
 
 
-def _pdf(src: Path, dossier: Path, prefixe: str) -> Support:
+def _pdf(src: Path, dossier: Path, prefixe: str,
+         importer: Optional[Importeur] = None) -> Support:
     nom = prefixe + ".pdf"
     shutil.copyfile(src, dossier / nom)       # sans les attributs (lecture seule…)
     try:
         pages = len(re.findall(rb"/Type\s*/Page(?![a-zA-Z])", src.read_bytes()))
     except Exception:  # noqa: BLE001
         pages = 0
-    return Support(nom, "pdf", src.name, f"≈ {pages} pages" if pages else "")
+    support = Support(nom, "pdf", src.name, f"≈ {pages} pages" if pages else "")
+    if importer is not None:
+        # Texte extrait : bien moins coûteux à transmettre que le PDF lu page à
+        # page. Un PDF scanné (presque pas de texte) reste à lire avec Read.
+        try:
+            pypdf = importer("pypdf", "pypdf")
+            lecteur = pypdf.PdfReader(str(src))
+            morceaux = []
+            for n, page in enumerate(lecteur.pages, 1):
+                texte = (page.extract_text() or "").strip()
+                if texte:
+                    morceaux.append(f"## Page {n}\n{texte}")
+            texte = "\n\n".join(morceaux)
+            if len(texte) >= 150 * max(1, len(lecteur.pages)) or len(texte) > 4000:
+                nom_texte = prefixe + ".pdf.md"
+                (dossier / nom_texte).write_text(f"# PDF — {src.name}\n\n{texte}\n", encoding="utf-8")
+                support.texte = nom_texte
+                support.detail = f"{len(lecteur.pages)} pages, texte extrait"
+        except Exception:  # noqa: BLE001  (PDF chiffré, abîmé…) : Claude le lira lui-même
+            pass
+    return support
+
+
+def _docx(src: Path, dossier: Path, prefixe: str, importer: Importeur) -> Support:
+    """Document Word : texte des paragraphes (titres repérés) et des tableaux."""
+    docx = importer("docx", "python-docx")
+    try:
+        doc = docx.Document(str(src))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"document Word illisible ({exc})") from exc
+    lignes = [f"# Document — {src.name}", ""]
+    for p in doc.paragraphs:
+        t = " ".join(p.text.split())
+        if not t:
+            continue
+        style = (p.style.name if p.style is not None else "") or ""
+        m = re.match(r"(Heading|Titre)\s*(\d)", style)
+        lignes.append(("#" * (int(m.group(2)) + 1) + " " + t) if m else t)
+    for n, table in enumerate(doc.tables, 1):
+        lignes += ["", f"Tableau {n} :"]
+        for rangee in table.rows:
+            lignes.append("| " + " | ".join(" ".join(c.text.split()) for c in rangee.cells) + " |")
+    texte = "\n".join(lignes).strip()
+    if len(texte.split()) < 5:
+        raise ValueError("document vide")
+    nom = prefixe + ".docx.md"
+    (dossier / nom).write_text(texte + "\n", encoding="utf-8")
+    return Support(nom, "document", src.name, f"{len(texte.split())} mots")
 
 
 def _notes(src: Path, dossier: Path, prefixe: str) -> Support:
@@ -393,7 +469,9 @@ def vocabulaire(supports: list[Support], dossier: Path, limite: int = 600) -> st
 
 
 def a_lire(supports: list[Support]) -> list[Support]:
-    return [s for s in supports if s.genre in LISIBLES_PAR_CLAUDE]
+    """Ceux que Claude doit lire avec l'outil Read : un PDF dont le texte a
+    été extrait n'en fait plus partie."""
+    return [s for s in supports if s.genre in LISIBLES_PAR_CLAUDE and not s.texte]
 
 
 def _situer(prise: str, debut: Optional[datetime.datetime], duree: float) -> str:
@@ -413,13 +491,21 @@ def _situer(prise: str, debut: Optional[datetime.datetime], duree: float) -> str
 
 def bloc_pour_claude(supports: list[Support], dossier: Path, *,
                      debut: Optional[datetime.datetime] = None, duree: float = 0,
-                     racine: Optional[Path] = None) -> str:
+                     racine: Optional[Path] = None, budget: Optional[int] = None,
+                     chemins: Optional[dict[str, str]] = None,
+                     intro: str = "Supports fournis avec l'enregistrement") -> str:
     """Le bloc <supports> placé dans l'entrée de Claude : la liste des
-    fichiers à lire, et le texte des diapositives et notes en clair."""
+    fichiers à lire, et le texte des diapositives et notes en clair.
+
+    `budget` : nombre total de caractères de texte reproduits (mode année,
+    où une matière peut avoir beaucoup de documents) ; au-delà, le document
+    est seulement listé, à lire avec Read si besoin. `chemins` : nom du
+    fichier d'origine -> chemin relatif à montrer (sous-dossier de la matière)."""
     if not supports:
         return ""
+    chemins = chemins or {}
     lignes = ["<supports>",
-              "Supports fournis avec l'enregistrement, dans le dossier supports/ du "
+              f"{intro}, dans le dossier supports/ du "
               "répertoire courant" + (f" (chemin complet : {racine})" if racine else "")
               + ". Les photos, images et PDF sont à lire avec l'outil Read ; "
               "le texte des diapositives et des notes est reproduit plus bas.", ""]
@@ -435,7 +521,13 @@ def bloc_pour_claude(supports: list[Support], dossier: Path, *,
             lignes.append(f"- {chemin} — photo {photos} (« {s.origine} », {s.detail}{quand})"
                           + _situer(s.prise, debut, duree))
         elif s.genre == "pdf":
-            lignes.append(f"- {chemin} — PDF « {s.origine} »" + (f", {s.detail}" if s.detail else ""))
+            lignes.append(f"- {chemin} — PDF « {chemins.get(s.origine, s.origine)} »"
+                          + (f", {s.detail}" if s.detail else "")
+                          + (" (texte reproduit ci-dessous ; à lire avec Read seulement pour ses "
+                             "schémas ou images)" if s.texte else ""))
+        elif s.genre == "document":
+            lignes.append(f"- {chemin} — document Word « {chemins.get(s.origine, s.origine)} » "
+                          "(texte reproduit ci-dessous)")
         elif s.genre == "diapos":
             lignes.append(f"- {chemin} — texte et notes des {s.detail} de « {s.origine} » "
                           "(reproduit ci-dessous)")
@@ -444,17 +536,31 @@ def bloc_pour_claude(supports: list[Support], dossier: Path, *,
         elif s.genre == "notes":
             lignes.append(f"- {chemin} — notes « {s.origine} » (reproduites ci-dessous)")
 
+    reste = budget
+    omis: list[str] = []
     for s in supports:
-        if s.genre not in ("diapos", "notes"):
+        if s.genre not in ("diapos", "notes", "document") and not (s.genre == "pdf" and s.texte):
             continue
+        fichier = s.texte if s.genre == "pdf" else s.fichier
         try:
-            texte = (dossier / s.fichier).read_text(encoding="utf-8", errors="replace")
+            texte = (dossier / fichier).read_text(encoding="utf-8", errors="replace")
         except Exception:  # noqa: BLE001
             continue
-        if len(texte) > TEXTE_MAX:
-            texte = texte[:TEXTE_MAX] + "\n[… tronqué : voir le fichier complet avec Read]"
-        genre = "diapositives" if s.genre == "diapos" else "notes"
-        lignes += ["", f'<document type="{genre}" fichier="{s.origine}">', texte.strip(), "</document>"]
+        limite = TEXTE_MAX if reste is None else min(TEXTE_MAX, reste)
+        if limite < 2000:
+            omis.append(f"supports/{fichier}")
+            continue
+        if len(texte) > limite:
+            texte = texte[:limite] + "\n[… tronqué : voir le fichier complet avec Read]"
+        if reste is not None:
+            reste -= len(texte)
+        genre = {"diapos": "diapositives", "notes": "notes", "document": "document Word",
+                 "pdf": "texte d'un PDF"}[s.genre]
+        lignes += ["", f'<document type="{genre}" fichier="{chemins.get(s.origine, s.origine)}">',
+                   texte.strip(), "</document>"]
+    if omis:
+        lignes += ["", "Faute de place, le texte de ces documents n'est pas reproduit ; lis-les "
+                       "avec Read si la matière l'exige : " + ", ".join(omis)]
     lignes.append("</supports>")
     return "\n".join(lignes)
 
@@ -462,7 +568,7 @@ def bloc_pour_claude(supports: list[Support], dossier: Path, *,
 def resume(supports: list[Support]) -> str:
     """« 3 photos, 1 PDF, 1 présentation (28 diapositives) »."""
     n = {g: sum(1 for s in supports if s.genre == g)
-         for g in ("photo", "pdf", "diapos", "image_diapo", "notes")}
+         for g in ("photo", "pdf", "diapos", "image_diapo", "notes", "document")}
     morceaux = []
     if n["photo"]:
         morceaux.append(f"{n['photo']} photo" + ("s" if n["photo"] > 1 else ""))
@@ -478,4 +584,6 @@ def resume(supports: list[Support]) -> str:
         morceaux.append(f"{n['pdf']} PDF")
     if n["notes"]:
         morceaux.append(f"{n['notes']} fichier" + ("s" if n["notes"] > 1 else "") + " de notes")
+    if n["document"]:
+        morceaux.append(f"{n['document']} document" + ("s" if n["document"] > 1 else "") + " Word")
     return ", ".join(morceaux) or "aucun"

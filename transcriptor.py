@@ -37,20 +37,23 @@ for _flux in ("stdout", "stderr"):
 APP_DIR = Path(__file__).resolve().parent
 SCRIPTS = APP_DIR / "scripts"
 PDF_SCRIPT = SCRIPTS / "generate_pdf.py"
+DOCX_SCRIPT = SCRIPTS / "generate_docx.py"
 ICONE = APP_DIR / "static" / "transcriptor.ico"
 MODELES_APP = APP_DIR / "consignes"      # modèles fournis avec l'application
+MODELES_ANNEE_APP = MODELES_APP / "annee"
 
 sys.path.insert(0, str(SCRIPTS))
+import annee as an  # noqa: E402  (mode année : horaire, classement des audios)
 import entete  # noqa: E402  (en-tête des fichiers de consignes)
 import supports as sup  # noqa: E402  (diapos, photos, notes joints à l'audio)
+import suivi  # noqa: E402  (mode année : ce qui est déjà dans les fiches)
 
 DOCUMENTS = Path(os.environ.get("USERPROFILE", Path.home())) / "Documents"
 SORTIE = Path(os.environ.get("TRANSCRIPTOR_SORTIE", DOCUMENTS / "Transcriptor"))
 CONSIGNES = SORTIE / "Consignes"          # modèles de l'utilisateur, modifiables
+CONSIGNES_ANNEE = CONSIGNES / "Année"     # ceux du mode année (horaire, notes, fiches, infos)
 
-AUDIO_EXT = (".mp3", ".wav", ".m4a", ".ogg", ".flac", ".opus", ".mp4", ".aac",
-             ".wma", ".mpeg", ".mpg", ".mpga", ".mp2", ".webm", ".mkv", ".mov",
-             ".avi", ".wmv", ".aiff", ".aif", ".amr", ".3gp", ".m4b", ".m4v", ".ts")
+AUDIO_EXT = an.EXT_AUDIO
 STEPS = ("supports", "transcription", "synthese", "pdf")
 
 # Masque la fenêtre noire des sous-processus.
@@ -70,6 +73,7 @@ REGLAGES = BASE_LOCALE / "reglages.json"
 # consignes choisies comptent donc, quel que soit le dossier d'où l'on
 # reprend — et deux fenêtres ouvertes ne se marchent pas dessus.
 ATELIER = BASE_LOCALE / "atelier"
+VENDOR = BASE_LOCALE / "vendor"             # mermaid.min.js, téléchargé une fois
 
 _enfants: list[subprocess.Popen] = []
 _verrou_enfants = threading.Lock()
@@ -598,6 +602,7 @@ class Traitement:
         self.notifier = notifier
         self.etat = "en_cours"
         self.erreur: Optional[str] = None
+        self.connexion = False          # échec parce que Claude Code n'est pas connecté
         self.usage: dict[str, Any] = {}
         self.fichiers: dict[str, str] = {}
         self.etapes = {n: {"statut": "attente", "avancement": 0.0, "detail": ""} for n in STEPS}
@@ -613,6 +618,7 @@ class Traitement:
     def instantane(self) -> dict[str, Any]:
         return {
             "etat": self.etat, "erreur": self.erreur, "usage": self.usage,
+            "connexion": self.connexion,
             "etapes": self.etapes, "fichiers": self.fichiers,
             "nom": self.audio.stem, "dossier": str(self.dossier),
             "consignes": self.consignes.stem if self.consignes else "",
@@ -739,6 +745,100 @@ def _panne_cuda(exc: Exception) -> bool:
     return any(x in m for x in ("cublas", "cudnn", "cuda", "libcu", "gpu"))
 
 
+class Interrompu(RuntimeError):
+    """Arrêt demandé par l'utilisateur."""
+
+
+def transcrire_fichier(audio: Path, sortie: Path, *, modele: str, matiere: str, termes: str,
+                       vocabulaire_supports: str = "", debut: Optional[datetime.datetime] = None,
+                       signaler=None, arret: Optional[threading.Event] = None,
+                       cpu: bool = False) -> dict[str, Any]:
+    """Transcrit `audio` dans `sortie`, écrite d'un bloc à la fin : un fichier
+    de transcription présent est toujours complet. signaler(avancement, detail)
+    suit la progression ; `arret` levé interrompt (Interrompu)."""
+    def dire(avancement: Optional[float], detail: str) -> None:
+        if signaler:
+            signaler(avancement, detail)
+
+    dire(None, "Chargement du modèle" + (" (processeur)" if cpu else ""))
+    m = charger_modele(modele, cpu=cpu)
+    dire(None, "Analyse de l'audio")
+    reglages = dict(
+        language="fr",
+        beam_size=5,
+        vad_filter=True,
+        condition_on_previous_text=False,
+        initial_prompt=amorce(matiere, termes),
+    )
+    vocabulaire = mots_cles(termes, vocabulaire_supports)
+    try:
+        segments, info = m.transcribe(str(audio), hotwords=vocabulaire or None, **reglages)
+    except TypeError:            # faster-whisper < 1.0.2 : pas de hotwords
+        segments, info = m.transcribe(str(audio), **reglages)
+
+    total = max(float(info.duration or 0.0), 1.0)
+    debut = debut or debut_enregistrement(audio)
+    sortie.parent.mkdir(parents=True, exist_ok=True)
+    provisoire = sortie.with_name(sortie.name + ".partiel")
+    depart = time.time()
+    minute_courante = -1
+    tampon: list[str] = []
+    try:
+        with provisoire.open("w", encoding="utf-8") as fh:
+            fh.write(f"Cours : {matiere or 'à préciser'}\n")
+            fh.write(f"Fichier : {audio.name}\nDurée : {hhmm(total)}\n")
+            if debut:
+                fh.write(f"Début : {debut:%Y-%m-%d %H:%M:%S}\n")
+            fh.write("\n")
+
+            for seg in segments:
+                if arret is not None and arret.is_set():
+                    raise Interrompu("arrêt demandé")
+                minute = int(seg.start // 60)
+                if minute != minute_courante:
+                    if tampon:
+                        fh.write(" ".join(tampon).strip() + "\n\n")
+                        tampon = []
+                    fh.write(f"[{hhmm(seg.start)}] ")
+                    minute_courante = minute
+                tampon.append(seg.text.strip())
+
+                part = seg.end / total
+                ecoule = time.time() - depart
+                reste = ecoule / part - ecoule if part > 0.02 else 0
+                detail = f"{hhmm(seg.end)} / {hhmm(total)}"
+                if reste > 60:
+                    detail += f" · reste ~{int(reste // 60)} min"
+                dire(part, detail)
+
+            if tampon:
+                fh.write(" ".join(tampon).strip() + "\n")
+        os.replace(provisoire, sortie)
+    finally:
+        if provisoire.exists():
+            try:
+                provisoire.unlink()
+            except OSError:
+                pass
+
+    mots = len(sortie.read_text(encoding="utf-8").split())
+    return {"duree": total, "debut": debut, "mots": mots}
+
+
+def transcrire_robuste(audio: Path, sortie: Path, **options: Any) -> dict[str, Any]:
+    """transcrire_fichier sur la carte graphique, sinon sur le processeur."""
+    try:
+        return transcrire_fichier(audio, sortie, cpu=False, **options)
+    except Interrompu:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if not _panne_cuda(exc):
+            raise
+    if options.get("signaler"):
+        options["signaler"](0.0, "CUDA indisponible — reprise sur le processeur")
+    return transcrire_fichier(audio, sortie, cpu=True, **options)
+
+
 def transcrire(t: Traitement) -> Path:
     try:
         return _transcrire(t, cpu=False)
@@ -753,64 +853,20 @@ def transcrire(t: Traitement) -> Path:
 def _transcrire(t: Traitement, *, cpu: bool) -> Path:
     t.maj("transcription", statut="en_cours",
           detail="Chargement du modèle" + (" (processeur)" if cpu else ""))
-    modele = charger_modele(t.options["modele"], cpu=cpu)
-
-    t.maj("transcription", detail="Analyse de l'audio")
-    reglages = dict(
-        language="fr",
-        beam_size=5,
-        vad_filter=True,
-        condition_on_previous_text=False,
-        initial_prompt=amorce(t.options["matiere"], t.options["termes"]),
-    )
-    vocabulaire = mots_cles(t.options["termes"],
-                            sup.vocabulaire(t.supports, t.dossier / "supports"))
-    try:
-        segments, info = modele.transcribe(str(t.audio), hotwords=vocabulaire or None,
-                                           **reglages)
-    except TypeError:            # faster-whisper < 1.0.2 : pas de hotwords
-        segments, info = modele.transcribe(str(t.audio), **reglages)
-
-    total = max(float(info.duration or 0.0), 1.0)
-    t.duree = total
-    t.debut = debut_enregistrement(t.audio)
     sortie = t.dossier / "transcription.txt"
-    depart = time.time()
-    minute_courante = -1
-    tampon: list[str] = []
 
-    with sortie.open("w", encoding="utf-8") as fh:
-        fh.write(f"Cours : {t.options['matiere'] or 'à préciser'}\n")
-        fh.write(f"Fichier : {t.audio.name}\nDurée : {hhmm(total)}\n")
-        if t.debut:
-            fh.write(f"Début : {t.debut:%Y-%m-%d %H:%M:%S}\n")
-        fh.write("\n")
+    def signaler(avancement: Optional[float], detail: str) -> None:
+        t.maj("transcription", avancement=avancement, detail=detail)
 
-        for seg in segments:
-            minute = int(seg.start // 60)
-            if minute != minute_courante:
-                if tampon:
-                    fh.write(" ".join(tampon).strip() + "\n\n")
-                    tampon = []
-                fh.write(f"[{hhmm(seg.start)}] ")
-                minute_courante = minute
-            tampon.append(seg.text.strip())
-
-            part = seg.end / total
-            ecoule = time.time() - depart
-            reste = ecoule / part - ecoule if part > 0.02 else 0
-            detail = f"{hhmm(seg.end)} / {hhmm(total)}"
-            if reste > 60:
-                detail += f" · reste ~{int(reste // 60)} min"
-            t.maj("transcription", avancement=part, detail=detail)
-
-        if tampon:
-            fh.write(" ".join(tampon).strip() + "\n")
-
-    mots = len(sortie.read_text(encoding="utf-8").split())
+    r = transcrire_fichier(
+        t.audio, sortie, modele=t.options["modele"], matiere=t.options["matiere"],
+        termes=t.options["termes"],
+        vocabulaire_supports=sup.vocabulaire(t.supports, t.dossier / "supports"),
+        signaler=signaler, cpu=cpu)
+    t.duree, t.debut = r["duree"], r["debut"]
     t.fichiers["txt"] = str(sortie)
     t.maj("transcription", statut="fait", avancement=1.0,
-          detail=f"{mots} mots".replace(",", " "))
+          detail=f"{r['mots']} mots".replace(",", " "))
     return sortie
 
 
@@ -959,6 +1015,34 @@ _RE_CLI_OBSOLETE = re.compile(
     r"does not support this model|version [\d.]+ or newer is required|"
     r"run 'claude update'|please update claude code", re.I)
 
+# Claude Code sans connexion valide au compte Claude. En mode -p, il écrit
+# « Not logged in · Please run /login », « Failed to authenticate… API Error:
+# 401 OAuth token has expired », « Invalid API key… ». Les nombres sont pris
+# en mots entiers : un identifiant de requête peut contenir « 401 ».
+_RE_CONNEXION = re.compile(
+    r"not logged in|run /login|failed to authenticate|authentication_failed|"
+    r"authentication_error|invalid api key|invalid authentication|login expired|"
+    r"oauth (token|session)|could not resolve authentication|"
+    r"invalid (auth |bearer )?token|\b401\b|unauthori[sz]ed", re.I)
+
+# Les mêmes, sans ambiguïté : pour juger une « réponse » de quelques mots
+# (« TERMINÉ, 401 mots écrits » n'est pas une erreur de connexion).
+_RE_CONNEXION_FORTE = re.compile(
+    r"not logged in|run /login|failed to authenticate|invalid api key|login expired|"
+    r"oauth (token|session) (has )?(expired|revoked)", re.I)
+
+# Variables qui, en mode -p, passent avant la connexion au compte Claude.
+_VARIABLES_CLE = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")
+
+
+class ConnexionClaude(RuntimeError):
+    """Claude Code n'est pas (ou plus) connecté au compte Claude : l'interface
+    propose alors « Se connecter à Claude »."""
+
+
+def variables_de_cle() -> list[str]:
+    return [v for v in _VARIABLES_CLE if os.environ.get(v, "").strip()]
+
 
 def chemin_claude() -> Optional[str]:
     trouve = shutil.which("claude") or shutil.which("claude.cmd")
@@ -1033,8 +1117,147 @@ def mettre_a_jour_claude(claude: str, signaler=None) -> str:
 
 _MAJ_CLAUDE_FINIE = threading.Event()
 _MAJ_CLAUDE_FINIE.set()   # levé par défaut : seul main() l'abaisse, le temps de la vérification
-# État affiché dans l'interface : {"etat": "maj" | "ok" | "echec" | "absent", "texte": …}
-_ETAT_CLAUDE: dict[str, str] = {"etat": "inconnu", "texte": ""}
+# État affiché dans l'interface : {"etat": "maj" | "ok" | "echec" | "absent" |
+# "connexion", "texte": …, "connexion": "oui" | "non" | ""}
+_ETAT_CLAUDE: dict[str, str] = {"etat": "inconnu", "texte": "", "connexion": ""}
+
+# Comment Claude Code s'authentifie (champ authMethod de « claude auth status »).
+_METHODES_CONNEXION = {
+    "claude.ai": "connecté à ton abonnement Claude",
+    "oauth_token": "connecté par un jeton (CLAUDE_CODE_OAUTH_TOKEN)",
+    "api_key": "connecté par une clé API, facturée à part de l'abonnement",
+    "api_key_helper": "connecté par une clé API (apiKeyHelper)",
+    "third_party": "connecté par un fournisseur tiers",
+}
+
+
+def connexion_claude(claude: str) -> dict[str, Any]:
+    """État de connexion de Claude Code d'après « claude auth status » (lecture
+    locale, sans appel à l'API). {"connu": bool, "connecte": bool, "methode": str}.
+    Un CLI trop ancien pour cette commande donne connu = False."""
+    code, sortie = _lancer_utilitaire([claude, "auth", "status"], 45)
+    m = re.search(r"\{.*\}", sortie, re.S)
+    try:
+        donnees = json.loads(m.group(0)) if m else None
+    except json.JSONDecodeError:
+        donnees = None
+    if not isinstance(donnees, dict):
+        return {"connu": False, "connecte": False, "methode": ""}
+    methode = str(donnees.get("authMethod") or "")
+    connecte = code == 0 and methode != "none"
+    if isinstance(donnees.get("loggedIn"), bool):
+        connecte = donnees["loggedIn"]
+    return {"connu": True, "connecte": connecte, "methode": methode}
+
+
+def texte_connexion(cx: dict[str, Any]) -> str:
+    if not cx.get("connu"):
+        return ""
+    if not cx.get("connecte"):
+        return "non connecté à ton compte Claude"
+    texte = _METHODES_CONNEXION.get(cx.get("methode") or "", "connecté")
+    if "ANTHROPIC_API_KEY" in variables_de_cle() and cx.get("methode") != "api_key":
+        texte += (" — mais la variable ANTHROPIC_API_KEY est définie : en mode "
+                  "automatique, Claude Code l'utilise à sa place")
+    return texte
+
+
+def poser_connexion(cx: dict[str, Any]) -> None:
+    """Ajoute l'état de connexion à celui de la mise à jour (« base ») dans
+    _ETAT_CLAUDE : texte affiché et pastille."""
+    if not cx.get("connu"):
+        _ETAT_CLAUDE["connexion"] = ""
+        return
+    base = _ETAT_CLAUDE.get("base", "")
+    texte = texte_connexion(cx)
+    _ETAT_CLAUDE["connexion"] = "oui" if cx.get("connecte") else "non"
+    _ETAT_CLAUDE["texte"] = f"{base} · {texte}." if base else f"Claude Code {texte}."
+    _ETAT_CLAUDE["etat"] = ((_ETAT_CLAUDE.get("etat_base") or "ok") if cx.get("connecte")
+                            else "connexion")
+
+
+def script_connexion(claude: str) -> str:
+    """Le .cmd ouvert par « Se connecter à Claude » : claude auth login (le
+    navigateur s'ouvre), session interactive avec /login si cette commande
+    n'existe pas encore, puis l'état obtenu et une pause pour le lire.
+    Pas de parenthèses dans les echo (blocs cmd) ; chcp 65001 pour les accents."""
+    c = f'"{claude}"'
+    lignes = [
+        "@echo off",
+        "chcp 65001 >nul",
+        "title Connexion de Claude Code",
+        "echo.",
+        "echo   Connexion de Claude Code à ton compte Claude",
+        "echo   ---------------------------------------------",
+        "echo   Ton navigateur va s'ouvrir : connecte-toi avec le compte de ton abonnement",
+        "echo   Claude et accepte. Si rien ne s'ouvre, copie dans le navigateur l'adresse",
+        "echo   affichée ci-dessous.",
+        "echo.",
+        f"call {c} auth login",
+        "if not errorlevel 1 goto etat",
+        "echo.",
+        "echo   La connexion n'a pas abouti par cette voie. Claude Code va s'ouvrir :",
+        "echo   tape /login, suis la procédure, puis tape /exit.",
+        "echo.",
+        "pause",
+        f"call {c}",
+        ":etat",
+        "echo.",
+        f"call {c} auth status --text",
+        "echo.",
+        "if not defined ANTHROPIC_API_KEY goto fin",
+        "echo   Attention : la variable ANTHROPIC_API_KEY est définie sur ce PC. En mode",
+        "echo   automatique, Claude Code l'utilise à la place de ton abonnement : supprime-la",
+        "echo   dans les variables d'environnement de Windows, puis relance Transcriptor.",
+        "echo.",
+        ":fin",
+        "echo   Tu peux fermer cette fenêtre et relancer dans Transcriptor.",
+        "echo.",
+        "pause",
+    ]
+    return "\r\n".join(lignes) + "\r\n"
+
+
+def ouvrir_connexion_claude(apres=None) -> dict[str, Any]:
+    """Ouvre une console qui connecte Claude Code au compte Claude. `apres`
+    est appelé quand la console se ferme (pour revérifier la connexion)."""
+    claude = chemin_claude()
+    if not claude:
+        return {"erreur": "Claude Code est introuvable : relance Installer.bat."}
+    if os.name != "nt":
+        return {"erreur": "Dans un terminal : claude auth login"}
+    BASE_LOCALE.mkdir(parents=True, exist_ok=True)
+    script = BASE_LOCALE / "connexion_claude.cmd"
+    script.write_bytes(script_connexion(claude).encode("utf-8"))
+    proc = subprocess.Popen(["cmd.exe", "/c", str(script)], cwd=str(Path.home()),
+                            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+    noter("claude : fenêtre de connexion ouverte")
+    if apres:
+        def guetter() -> None:
+            try:
+                proc.wait()
+            finally:
+                apres()
+        threading.Thread(target=guetter, daemon=True).start()
+    return {"ok": True}
+
+
+def verifier_connexion(signaler=None) -> dict[str, str]:
+    """Relit l'état de connexion (après la fenêtre de connexion) et le pousse."""
+    claude = chemin_claude()
+    if claude:
+        cx = connexion_claude(claude)
+        noter(f"claude : connexion — {cx}")
+        poser_connexion(cx)
+    # Compteur de relectures : l'interface sait ainsi que la fenêtre de
+    # connexion s'est refermée et que l'état affiché est frais.
+    _ETAT_CLAUDE["verifie"] = str(int(_ETAT_CLAUDE.get("verifie") or 0) + 1)
+    if signaler:
+        try:
+            signaler(dict(_ETAT_CLAUDE))
+        except Exception:
+            pass
+    return dict(_ETAT_CLAUDE)
 
 
 def maj_claude_en_arriere_plan(signaler=None) -> None:
@@ -1044,7 +1267,7 @@ def maj_claude_en_arriere_plan(signaler=None) -> None:
     ne pas exécuter un binaire en cours de remplacement."""
 
     def poser(etat: str, texte: str) -> None:
-        _ETAT_CLAUDE.update(etat=etat, texte=texte)
+        _ETAT_CLAUDE.update(etat=etat, texte=texte, base=texte.rstrip(". "), etat_base=etat)
         noter(f"claude (démarrage) : {texte}")
         if signaler:
             try:
@@ -1070,6 +1293,14 @@ def maj_claude_en_arriere_plan(signaler=None) -> None:
             poser("echec", f"Claude Code {apres or avant or ''} : mise à jour impossible "
                            "pour l'instant (hors ligne ?) — la version installée "
                            "sera utilisée.".replace("  ", " "))
+        # Connexion au compte : signalée dès l'ouverture, avant tout traitement.
+        _MAJ_CLAUDE_FINIE.set()
+        cx = connexion_claude(claude)
+        noter(f"claude (démarrage) : connexion — {cx}")
+        if cx.get("connu"):
+            poser_connexion(cx)
+            if signaler:
+                signaler(dict(_ETAT_CLAUDE))
     except Exception as exc:  # noqa: BLE001
         poser("echec", f"Claude Code : vérification impossible ({str(exc)[:80]}).")
     finally:
@@ -1100,16 +1331,23 @@ def _expliquer(message: str, code: Optional[int], modele: str = "") -> str:
     if "effort" in bas and re.search(r"not supported|invalid|unsupported|not available", bas):
         return (f"Ce niveau d'effort n'est pas disponible pour le modèle {nom}. Choisis "
                 f"« Par défaut » ou un autre niveau, puis relance. ({message[:160]})")
+    if _RE_CONNEXION.search(message):
+        texte = ("Claude Code n'est pas connecté à ton compte Claude (connexion absente "
+                 "ou expirée). Clique « Se connecter à Claude », connecte-toi dans le "
+                 "navigateur, puis relance.")
+        cles = variables_de_cle()
+        if cles:
+            texte += (f" Attention : la variable {cles[0]} est définie sur ce PC ; en mode "
+                      "automatique, Claude Code l'utilise à la place de ta connexion. "
+                      "Supprime-la (Windows : « Modifier les variables d'environnement "
+                      "pour votre compte »), puis relance Transcriptor.")
+        return texte + f" (Claude Code : {message.strip()[:160]})"
     if re.search(r"usage limit|rate limit|limit (will )?reset|hit your limit|"
-                 r"limite d.utilisation|too many requests|429", bas):
+                 r"limite d.utilisation|too many requests|\b429\b", bas):
         return ("Limite d'utilisation de ton abonnement Claude atteinte"
                 + (f" pour le modèle {nom}" if modele else "") + ". Attends la "
                 "réinitialisation, ou relance la synthèse avec un autre modèle "
                 f"(Sonnet, Haiku). ({message[:160]})")
-    if re.search(r"not logged in|log ?in|authenticat|api key|unauthori|401|"
-                 r"invalid.*token|oauth", bas):
-        return ("Claude Code n'est pas connecté. Ouvre une invite de commandes, "
-                "tape 'claude' et suis la procédure de connexion.")
     if "max_turns" in bas or "maximum number of turns" in bas or "max turns" in bas:
         return ("Claude a dépassé le nombre de tours autorisés avant de terminer. "
                 "Relance la synthèse ; si ça se reproduit, la transcription est "
@@ -1118,7 +1356,7 @@ def _expliquer(message: str, code: Optional[int], modele: str = "") -> str:
                  r"exceeds.*(context|maximum)", bas):
         return ("Transcription trop longue pour une seule passe de Claude. "
                 "Coupe l'audio en deux et relance chaque moitié.")
-    if re.search(r"overloaded|529|503|502|econnreset|enotfound|etimedout|"
+    if re.search(r"overloaded|\b(529|503|502)\b|econnreset|enotfound|etimedout|"
                  r"network|fetch failed|socket", bas):
         return ("Claude est injoignable ou surchargé pour le moment. "
                 f"Réessaie dans quelques minutes. ({message[:160]})")
@@ -1129,8 +1367,13 @@ def _expliquer(message: str, code: Optional[int], modele: str = "") -> str:
 
 def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
                     jalons: Jalons) -> tuple[str, dict[str, Any]]:
+    """Un appel à Claude Code. `t` est un Traitement (mode cours) ou une
+    EtapeAnnee : seuls maj(), dossier, options, consignes, supports et les
+    attributs facultatifs etape_claude / journal_claude / lieu_journal sont lus."""
     debut = time.time()
-    journal = t.dossier / JOURNAL_SYNTHESE
+    etape = getattr(t, "etape_claude", "synthese")
+    journal = getattr(t, "journal_claude", None) or t.dossier / JOURNAL_SYNTHESE
+    lieu = getattr(t, "lieu_journal", "le dossier du cours")
     inactivite = INACTIVITE_MAX if "stream-json" in commande else None
 
     def tracer(*morceaux: str) -> None:
@@ -1152,6 +1395,7 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
             cwd=entree.parent, creationflags=NO_WINDOW, shell=False,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         ))
+    t.processus = proc            # pour pouvoir l'arrêter (mode année)
 
     # stderr est vidé à part : s'il se remplissait sans lecteur, Claude se
     # bloquerait en écriture et on attendrait un résultat qui ne vient jamais.
@@ -1228,14 +1472,23 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
                 resultat = ev
             if genre == "system" and ev.get("subtype") == "init" and ev.get("model"):
                 modele_reel = str(ev.get("model"))
-                t.maj("synthese", detail=f"Claude lit la transcription · {modele_reel}")
+                t.maj(etape, detail=f"Claude lit le contenu · {modele_reel}"
+                      if etape != "synthese" else f"Claude lit la transcription · {modele_reel}")
             if genre == "assistant":
-                # Claude lit les supports avant de rédiger : on le montre.
+                # Claude lit les supports avant de rédiger, ou écrit ses
+                # fichiers (fiches longues) : on le montre.
                 for b in (ev.get("message") or {}).get("content") or []:
                     if isinstance(b, dict) and b.get("type") == "tool_use":
-                        cible = str((b.get("input") or {}).get("file_path") or "")
-                        t.maj("synthese", detail="Lecture des supports · "
-                              + (Path(cible).name or str(b.get("name") or "")))
+                        entrees = b.get("input") or {}
+                        cible = Path(str(entrees.get("file_path") or "")).name
+                        if b.get("name") in ("Write", "Edit"):
+                            ecrit = str(entrees.get("content") or entrees.get("new_string") or "")
+                            mots += len(ecrit.split())
+                            t.maj(etape, avancement=mots / (mots + 6000),
+                                  detail=f"Rédaction · {cible} · {mots} mots")
+                        else:
+                            t.maj(etape, detail="Lecture des supports · "
+                                  + (cible or str(b.get("name") or "")))
 
             morceau = _fragment(ev)
             if not morceau:
@@ -1252,12 +1505,12 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
                     mots += len(complet.split())
             ecoule = int(time.time() - debut)
             if jalons.total:
-                t.maj("synthese",
+                t.maj(etape,
                       avancement=section / jalons.total,
                       detail=(jalons.etiquette(section) if section
                               else f"Rédaction… {ecoule} s"))
             else:
-                t.maj("synthese",
+                t.maj(etape,
                       avancement=mots / (mots + 4000) if mots else 0.04,
                       detail=(f"Rédaction… {mots} mots · {ecoule} s" if mots
                               else f"Rédaction… {ecoule} s"))
@@ -1280,6 +1533,9 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
     if not markdown.strip():
         markdown = texte_assistant or texte_deltas
     en_erreur = bool(resultat and resultat.get("is_error"))
+    # Une « réponse » de quelques mots qui dit de se connecter n'en est pas une.
+    if len(markdown.strip()) < 300 and _RE_CONNEXION_FORTE.search(markdown):
+        en_erreur = True
 
     # Un vrai résultat prime sur le code de sortie : si seul le wrapper
     # claude.cmd est mort, node a quand même livré la synthèse.
@@ -1298,9 +1554,10 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
 
     # --- échec : reconstituer le message le plus parlant -------------------
     if en_erreur:
-        message = (_texte_resultat(resultat)
-                   or " ".join(str(e) for e in (resultat.get("errors") or []))
-                   or str(resultat.get("subtype") or "")).strip()
+        message = ((_texte_resultat(resultat) if resultat else "")
+                   or " ".join(str(e) for e in ((resultat or {}).get("errors") or []))
+                   or str((resultat or {}).get("subtype") or "")
+                   or markdown).strip()
     elif erreurs:
         message = erreurs
     else:
@@ -1318,6 +1575,7 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
         noter(f"claude : CLI obsolète — {message[:200]}")
         raise _CliObsolete(message or erreurs)
 
+    connexion = not garde["motif"] and bool(_RE_CONNEXION.search(message))
     if garde["motif"]:
         message = f"Synthèse interrompue : {garde['motif']}."
     else:
@@ -1330,9 +1588,9 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
             message += f" Le texte déjà rédigé est dans {PARTIEL_SYNTHESE}."
         except Exception:
             pass
-    message += f" Détail : {JOURNAL_SYNTHESE} dans le dossier du cours."
+    message += f" Détail : {journal.name} dans {lieu}."
     noter(f"claude : échec (code {proc.returncode}) — {message[:300]}")
-    raise RuntimeError(message[:400])
+    raise (ConnexionClaude if connexion else RuntimeError)(message[:800])
 
 
 def preparer_atelier(t: Traitement, corps: str, transcription: Path) -> Path:
@@ -1371,7 +1629,12 @@ def preparer_atelier(t: Traitement, corps: str, transcription: Path) -> Path:
     return entree
 
 
-def synthetiser(t: Traitement, transcription: Path) -> Path:
+def executer_claude(t: Any, prompt: str, entree: Path, jalons: Jalons, *,
+                    outils: tuple[str, ...] = (), tours: int = 12) -> tuple[str, dict[str, Any]]:
+    """Lance Claude Code sur `entree` (stdin) avec le modèle et l'effort de
+    t.options, en se repliant sur des options plus anciennes si le CLI ne les
+    connaît pas, et en le mettant à jour s'il refuse le modèle."""
+    etape = getattr(t, "etape_claude", "synthese")
     claude = chemin_claude()
     if not claude:
         raise RuntimeError(
@@ -1381,43 +1644,17 @@ def synthetiser(t: Traitement, transcription: Path) -> Path:
     # Une mise à jour lancée au démarrage est peut-être encore en train de
     # remplacer le binaire : on ne l'exécute pas avant qu'elle ait fini.
     if not _MAJ_CLAUDE_FINIE.is_set():
-        t.maj("synthese", statut="en_cours", detail="Mise à jour de Claude Code…")
+        t.maj(etape, statut="en_cours", detail="Mise à jour de Claude Code…")
         _MAJ_CLAUDE_FINIE.wait(600)
 
-    t.maj("synthese", statut="en_cours", detail="Claude lit la transcription")
-
-    # Les consignes sont relues à chaque synthèse : une modification du
-    # fichier s'applique au cours suivant, ou à « Relancer la synthèse ».
-    if not t.consignes or not t.consignes.is_file():
-        raise RuntimeError("Le fichier de consignes a disparu. Choisis un modèle dans la "
-                           "liste « Consignes de synthèse » et relance.")
-    regles = entete.lire(t.consignes)
-    if not regles.corps.strip():
-        raise RuntimeError(f"Le fichier de consignes « {t.consignes.stem} » est vide.")
-    try:  # trace : quelles consignes ont produit ce support
-        shutil.copyfile(t.consignes, t.dossier / "consignes.md")
-    except OSError as exc:
-        noter(f"copie des consignes impossible : {exc}")
-    jalons = Jalons.depuis(regles.corps)
-    entree = preparer_atelier(t, regles.corps, transcription)
-
-    # 12 tours suffisent à rédiger ; chaque image ou tranche de PDF à lire
-    # en demande un de plus.
-    lectures = 0
-    for s in sup.a_lire(t.supports):
-        pages = re.search(r"\d+", s.detail) if s.genre == "pdf" else None
-        lectures += 1 + (int(pages.group(0)) // 15 if pages else 0)
-    base = [claude, "-p", consigne(bool(t.supports)),
-            "--max-turns", str(min(80, 12 + lectures))]
-    if lectures:
-        base += ["--allowedTools", "Read"]
+    base = [claude, "-p", prompt, "--max-turns", str(tours)]
+    if outils:
+        base += ["--allowedTools", ",".join(outils)]
     modele, effort = reglages_claude(t.options)
     if modele:
         base += ["--model", modele]
     if effort:
         base += ["--effort", effort]
-    t.maj("synthese", detail="Claude lit la transcription"
-          + (f" · {modele}" if modele else "") + (f" · effort {effort}" if effort else ""))
     # Du plus bavard au plus sobre : chaque repli perd un peu d'avancement
     # mais reste fonctionnel sur une version plus ancienne du CLI.
     tentatives = [
@@ -1456,26 +1693,57 @@ def synthetiser(t: Traitement, transcription: Path) -> Path:
                            "Claude Code n'a accepté aucun format de sortie.")
 
     try:
-        markdown, usage = essayer()
+        return essayer()
     except _CliObsolete as exc:
         # L'API refuse le modèle à cette version du CLI : on met à jour et
         # on refait un essai, une seule fois.
         nouvelle = mettre_a_jour_claude(
-            claude, lambda d: t.maj("synthese", statut="en_cours", detail=d))
+            claude, lambda d: t.maj(etape, statut="en_cours", detail=d))
         if not nouvelle:
             raise RuntimeError(
                 "Claude Code est trop ancien pour ce modèle et sa mise à jour "
                 "automatique a échoué. Dans une invite de commandes : "
                 "claude update  (ou : npm install -g @anthropic-ai/claude-code@latest), "
-                f"puis « Relancer la synthèse ». ({str(exc)[:120]})") from exc
-        t.maj("synthese", statut="en_cours",
-              detail=f"Claude Code {nouvelle} — nouvel essai")
+                f"puis relance. ({str(exc)[:120]})") from exc
+        t.maj(etape, statut="en_cours", detail=f"Claude Code {nouvelle} — nouvel essai")
         try:
-            markdown, usage = essayer()
+            return essayer()
         except _CliObsolete as exc2:
             raise RuntimeError(
                 f"Claude Code {nouvelle} refuse toujours ce modèle. "
                 f"({str(exc2)[:200]})") from exc2
+
+
+def synthetiser(t: Traitement, transcription: Path) -> Path:
+    t.maj("synthese", statut="en_cours", detail="Claude lit la transcription")
+
+    # Les consignes sont relues à chaque synthèse : une modification du
+    # fichier s'applique au cours suivant, ou à « Relancer la synthèse ».
+    if not t.consignes or not t.consignes.is_file():
+        raise RuntimeError("Le fichier de consignes a disparu. Choisis un modèle dans la "
+                           "liste « Consignes de synthèse » et relance.")
+    regles = entete.lire(t.consignes)
+    if not regles.corps.strip():
+        raise RuntimeError(f"Le fichier de consignes « {t.consignes.stem} » est vide.")
+    try:  # trace : quelles consignes ont produit ce support
+        shutil.copyfile(t.consignes, t.dossier / "consignes.md")
+    except OSError as exc:
+        noter(f"copie des consignes impossible : {exc}")
+    jalons = Jalons.depuis(regles.corps)
+    entree = preparer_atelier(t, regles.corps, transcription)
+
+    # 12 tours suffisent à rédiger ; chaque image ou tranche de PDF à lire
+    # en demande un de plus.
+    lectures = 0
+    for s in sup.a_lire(t.supports):
+        pages = re.search(r"\d+", s.detail) if s.genre == "pdf" else None
+        lectures += 1 + (int(pages.group(0)) // 15 if pages else 0)
+    modele, effort = reglages_claude(t.options)
+    t.maj("synthese", detail="Claude lit la transcription"
+          + (f" · {modele}" if modele else "") + (f" · effort {effort}" if effort else ""))
+    markdown, usage = executer_claude(t, consigne(bool(t.supports)), entree, jalons,
+                                      outils=("Read",) if lectures else (),
+                                      tours=min(80, 12 + lectures))
 
     if not markdown.strip():
         raise RuntimeError("Claude a renvoyé une réponse vide. "
@@ -1530,6 +1798,1346 @@ def mettre_en_page(t: Traitement, markdown: Path) -> None:
 
 
 # ----------------------------------------------------------------------
+# Mode année : un dossier par année d'études, l'horaire classe les
+# enregistrements par matière, une matière = un seul cours suivi
+# ----------------------------------------------------------------------
+NOTES_SEANCE = "Notes de séance"
+FICHES_MATIERE = "Fiches matière"
+INFOS_MATIERE = "Infos matière"
+LECTURE_HORAIRE = "Horaire"
+TRAVAIL = an.DOSSIER_TECHNIQUE          # « _Transcriptor » dans chaque matière
+BUDGET_SUPPORTS_FICHES = 170_000        # caractères de supports reproduits pour les fiches
+BUDGET_NOTES_LOT = 150_000              # caractères de notes de séance par passage de Claude
+BUDGET_SUPPORTS_INFOS = 60_000
+
+
+def installer_modeles_annee() -> None:
+    """Comme installer_modeles(), pour les consignes du mode année
+    (Documents\\Transcriptor\\Consignes\\Année)."""
+    CONSIGNES_ANNEE.mkdir(parents=True, exist_ok=True)
+    registre = CONSIGNES_ANNEE / ".modeles_livres"
+    try:
+        livres = set(registre.read_text(encoding="utf-8").split("\n")) - {""}
+    except OSError:
+        livres = set()
+    change = False
+    for src in sorted(MODELES_ANNEE_APP.glob("*.md")) if MODELES_ANNEE_APP.is_dir() else []:
+        cible = CONSIGNES_ANNEE / src.name
+        if not cible.exists() and src.name not in livres:
+            shutil.copyfile(src, cible)
+            noter(f"consignes année : modèle « {src.stem} » installé")
+            change = True
+        if src.name not in livres:
+            livres.add(src.name)
+            change = True
+    if change:
+        registre.write_text("\n".join(sorted(livres)) + "\n", encoding="utf-8")
+
+
+def consignes_annee(nom: str) -> Path:
+    """Le modèle `nom` du mode année : celui de l'utilisateur (modifiable),
+    sinon celui livré avec l'application."""
+    try:
+        installer_modeles_annee()
+    except Exception as exc:  # noqa: BLE001
+        noter(f"consignes année : installation impossible ({exc})")
+    for base in (CONSIGNES_ANNEE, MODELES_ANNEE_APP):
+        p = base / f"{nom}.md"
+        if p.is_file():
+            return p
+    raise FileNotFoundError(f"Consignes « {nom} » introuvables dans {CONSIGNES_ANNEE}.")
+
+
+def consigne_annee(genre: str) -> str:
+    """Le prompt de `claude -p` pour une étape du mode année. Pas de chevrons
+    ni de guillemets droits : claude.cmd passe par cmd.exe."""
+    debut = "L'entrée standard contient, entre balises : consignes, les règles à appliquer ; "
+    fin = (" Réponds uniquement par le Markdown final, sans préambule ni commentaire. "
+           "Personne ne pourra te répondre : ne pose aucune question.")
+    if genre == "horaire":
+        return (debut + "horaire, le fichier d'horaire et, quand il a pu être extrait, son texte. "
+                "Si un fichier est indiqué, lis-le avec l'outil Read pour voir sa mise en page et "
+                "ses couleurs. Réponds uniquement par le JSON demandé, sans aucun autre texte.")
+    if genre == "notes":
+        return (debut + "seance, la description de la séance ; vocabulaire, les termes tirés des "
+                "supports de la matière ; transcription, la transcription automatique de la "
+                "séance. Produis les notes décrites par les consignes." + fin)
+    if genre == "infos":
+        return (debut + "matiere ; infos, les informations pratiques relevées séance par séance ; "
+                "supports, les documents de la matière. Rédige la fiche décrite par les consignes."
+                + fin)
+    if genre == "infos_ajout":
+        return (debut + "mission, ce que tu dois faire ; infos_actuelles, la fiche telle qu'elle "
+                "est ; matiere ; infos, les informations des nouvelles séances seulement ; "
+                "supports, les nouveaux documents seulement. Réponds par la fiche complète mise "
+                "à jour, en suivant la mission et les consignes." + fin)
+    if genre == "fiches_ajout":
+        return (debut + "mission, ce que tu dois faire ; matiere ; notes, les nouvelles séances "
+                "seulement ; supports, les nouveaux documents seulement. Les fiches existantes "
+                "sont dans le répertoire courant, un fichier par catégorie, décrits dans la "
+                "mission. Intègre le nouveau en suivant la mission, avec les outils Read, Edit et "
+                "Write. Quand tout est intégré, réponds seulement TERMINÉ, ou RIEN À AJOUTER si "
+                "rien n'était nouveau. Personne ne pourra te répondre : ne pose aucune question.")
+    return (debut + "matiere ; notes, les notes de chaque séance ; supports, les documents de la "
+            "matière, à lire avec l'outil Read quand ils sont listés comme fichiers et utiles. "
+            "Rédige le document décrit par les consignes et écris-le avec l'outil Write dans le "
+            "répertoire courant : un fichier par catégorie, nommés 010.md, 020.md, 030.md et "
+            "ainsi de suite dans l'ordre, chaque fichier commençant par son titre de catégorie, "
+            "et le lexique dans 990.md. N'écris aucun autre fichier. Quand tout est écrit, "
+            "réponds seulement TERMINÉ. Personne ne pourra te répondre : ne pose aucune question.")
+
+
+MISSION_AJOUT_FICHES = """Les fiches de cette matière existent déjà. Elles sont dans le répertoire courant ({atelier}), un fichier par catégorie :
+
+{plan}
+
+Tu reçois seulement ce qui est nouveau : {quoi}. Intègre-le aux fiches existantes, comme si les fiches avaient été rédigées d'emblée avec :
+
+1. Chaque notion nouvelle va à sa place logique : complète une sous-catégorie existante, ajoute une sous-catégorie (###) dans la bonne catégorie, ou, si elle ouvre un nouveau thème, crée une catégorie : un nouveau fichier dont le numéro la place au bon endroit (025.md entre 020.md et 030.md), qui commence par son titre ##.
+2. Une notion déjà traitée est enrichie (précision, exemple, nuance, insistance de l'enseignant), jamais répétée ailleurs.
+3. Lis avec l'outil Read seulement les fichiers que tu vas modifier, puis modifie-les avec l'outil Edit. Ne réécris pas un fichier entier pour y ajouter quelques lignes. Ne supprime rien de juste : corrige seulement ce que le nouveau contredit ou précise.
+4. Complète le lexique ({lexique}) avec les nouveaux termes, en gardant l'ordre alphabétique.
+5. Respecte toutes les conventions des consignes : niveaux de titres, mots-clés en gras, encadrés, exemples concrets, tableaux, schémas.{revues}
+
+Quand tout est intégré, réponds seulement TERMINÉ — ou RIEN À AJOUTER si le nouveau n'apporte rien que les fiches ne disent déjà."""
+
+MISSION_AJOUT_INFOS = """La fiche « Infos importantes » de cette matière existe déjà (infos_actuelles). Tu reçois seulement ce qui est nouveau : {quoi}. Réponds par la fiche complète mise à jour :
+
+1. Garde tout ce qui reste vrai, avec ses sources entre parenthèses.
+2. Ajoute les informations nouvelles à leur section ; quand une information nouvelle remplace une ancienne (date d'examen déplacée, consigne modifiée…), garde la plus récente et signale le changement.
+3. Respecte les sections et les conventions des consignes."""
+
+
+def nom_fichier_matiere(m: an.Matiere) -> str:
+    return an.nom_dossier(m.titre, 50)
+
+
+def ecrire_atomique(chemin: Path, texte: str) -> None:
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    tmp = chemin.with_name(chemin.name + ".tmp")
+    tmp.write_text(texte, encoding="utf-8")
+    os.replace(tmp, chemin)
+
+
+def texte_de_transcription(chemin: Path) -> str:
+    """Le corps d'une transcription, sans son en-tête (Cours, Fichier…)."""
+    texte = chemin.read_text(encoding="utf-8", errors="replace")
+    entete_, sep, corps = texte.partition("\n\n")
+    if sep and re.match(r"^(Cours|Fichier)\s*:", entete_):
+        return corps.strip()
+    return texte.strip()
+
+
+def section_markdown(md: str, titre: str) -> str:
+    """Le contenu d'une section « ## titre » (jusqu'à la section suivante)."""
+    cle = an.plat(titre)
+    sortie: list[str] = []
+    dedans = False
+    for ligne in md.splitlines():
+        m = re.match(r"^(#{1,2})\s+(.*)$", ligne)
+        if m:
+            if dedans:
+                break
+            dedans = an.plat(m.group(2)).startswith(cle)
+            continue
+        if dedans:
+            sortie.append(ligne)
+    return "\n".join(sortie).strip()
+
+
+def sauvegarder_version(fichier: Path, dossier: Path, garder: int = 8) -> None:
+    """Avant de remplacer un document Word, sa version actuelle (peut-être
+    annotée à la main) part dans _Transcriptor\\versions."""
+    if not fichier.is_file():
+        return
+    try:
+        dossier.mkdir(parents=True, exist_ok=True)
+        date = datetime.datetime.fromtimestamp(fichier.stat().st_mtime)
+        cible = dossier / f"{fichier.stem} ({date:%Y-%m-%d %Hh%M}){fichier.suffix}"
+        if not cible.exists():
+            shutil.copy2(fichier, cible)
+        anciennes = sorted(dossier.glob(f"{an.glob_echappe(fichier.stem)} (*){fichier.suffix}"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+        for vieux in anciennes[garder:]:
+            try:
+                vieux.unlink()
+            except OSError:
+                pass
+    except OSError as exc:
+        noter(f"version précédente de {fichier.name} non gardée : {exc}")
+
+
+def produire_word(md: Path, sortie: Path, consignes: Path, m: an.Matiere, *,
+                  sous_titre: str, travail: Path) -> tuple[Path, list[str]]:
+    """Markdown -> Word (generate_docx.py, dans un processus à part comme le PDF)."""
+    module_requis("docx", "python-docx")
+    sauvegarder_version(sortie, travail / "versions")
+    commande = [sys.executable, str(DOCX_SCRIPT), str(md), "--sortie", str(sortie),
+                "--consignes", str(consignes), "--titre", m.nom, "--sous-titre", sous_titre,
+                "--couleur", m.couleur, "--etiquette", m.ue, "--cache", str(VENDOR),
+                "--images", str(travail / "schemas")]
+    proc = suivre(subprocess.Popen(commande, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   creationflags=NO_WINDOW))
+    try:
+        sortie_std, erreurs = proc.communicate(timeout=900)
+    except subprocess.TimeoutExpired:
+        tuer(proc, "mise en page Word trop longue")
+        sortie_std, erreurs = proc.communicate()
+    lignes = (sortie_std or b"").decode("utf-8", "replace").strip().splitlines()
+    if proc.returncode != 0 or not lignes:
+        dernieres = (erreurs or b"").decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError("Mise en page Word impossible : "
+                           + (dernieres[-1][:200] if dernieres else f"code {proc.returncode}"))
+    info = json.loads(lignes[-1])
+    avert = list(info.get("avertissements") or [])
+    if info.get("schemas_rates"):
+        avert.append(f"{info['schemas_rates']} schéma(s) remplacé(s) par du texte")
+    return Path(info["sortie"]), avert
+
+
+class EtapeAnnee:
+    """Ce qu'executer_claude() attend d'un traitement, pour une tâche du mode
+    année : la progression va à la tâche correspondante du chantier."""
+    etape_claude = "claude"
+
+    def __init__(self, chantier: "Chantier", cle: str, travail: Path,
+                 options: dict[str, Any], consignes: Optional[Path] = None):
+        self.chantier, self.cle = chantier, cle
+        self.dossier = travail
+        self.options = options
+        self.consignes = consignes
+        self.journal_claude = travail / "claude.log"
+        self.lieu_journal = f"« {travail} »"
+        self.supports: list[sup.Support] = []
+        self.avertissements = chantier.remarques
+        self.processus: Optional[subprocess.Popen] = None
+        chantier.etapes_claude.append(self)
+
+    def maj(self, etape: str, *, statut: Optional[str] = None,
+            avancement: Optional[float] = None, detail: Optional[str] = None) -> None:
+        self.chantier.maj_tache(self.cle, statut=statut, avancement=avancement, detail=detail)
+
+
+class _PlanSeance:
+    def __init__(self, seance: an.Seance, notes: Path, audios: list[tuple[an.Classement, Path]]):
+        self.seance, self.notes, self.audios = seance, notes, audios
+        self.echec = False
+
+
+class _PlanMatiere:
+    def __init__(self, m: an.Matiere, dossier: Path, sources: list[Path]):
+        self.m, self.dossier, self.sources = m, dossier, sources
+        self.travail = dossier / TRAVAIL
+        self.seances: list[_PlanSeance] = []
+        self.supports: Optional[list[sup.Support]] = None
+        self.vocabulaire = ""
+        self.echec = False
+        self.reecrire = False            # « Tout réécrire » : repartir de zéro
+
+    def documents(self) -> dict[str, Path]:
+        """Documents du dossier de la matière, par chemin relatif."""
+        sortie = {}
+        for p in self.sources:
+            try:
+                sortie[p.relative_to(self.dossier).as_posix()] = p
+            except ValueError:
+                sortie[p.name] = p
+        return sortie
+
+    def notes(self) -> dict[str, Path]:
+        return {ps.seance.cle: ps.notes for ps in self.seances}
+
+    def etat(self) -> suivi.EtatMatiere:
+        return etat_matiere(self.travail, self.notes(), self.documents())
+
+
+def etat_matiere(travail: Path, notes: dict[str, Path], documents: dict[str, Path]) -> suivi.EtatMatiere:
+    """Ce que contiennent déjà les fiches et les infos d'une matière (un
+    etat.json d'avant est traduit au passage)."""
+    return suivi.EtatMatiere.charger(
+        travail, notes, documents,
+        signature_v1=lambda: signature_matiere(list(notes.values()), list(documents.values())))
+
+
+def signature_matiere(notes: list[Path], sources: list[Path]) -> str:
+    return an.signature([*notes, *sources])
+
+
+class Chantier:
+    """Un passage sur une année : lecture de l'horaire, ou traitement des
+    matières (transcriptions sur la carte graphique et rédactions par Claude
+    menées en parallèle), ou remise en page des documents Word."""
+
+    def __init__(self, annee_: an.Annee, options: dict[str, Any], notifier):
+        self.id = next(_NUMEROS)
+        self.annee = annee_
+        self.options = options
+        self.notifier = notifier
+        self.genre = options.get("genre") or "tout"      # tout | horaire | word
+        self.arret = threading.Event()
+        self.etat = "en_cours"
+        self.erreur: Optional[str] = None
+        self.remarques: list[str] = []
+        self.taches: dict[str, dict[str, Any]] = {}
+        self.plan: list[_PlanMatiere] = []
+        self.horaire: Optional[an.Horaire] = None
+        self.verrou = threading.RLock()
+        self.cond = threading.Condition(self.verrou)
+        self._verrou_supports = threading.Lock()
+        self.gpu_fini = False
+        self.claude_bloque = ""
+        self.connexion = False          # Claude Code pas connecté : bouton « Se connecter »
+        self.etapes_claude: list[EtapeAnnee] = []
+        self._dernier_envoi = 0.0
+        self.debut = time.time()
+
+    # -- suivi --------------------------------------------------------------
+    def tache(self, cle: str, genre: str, matiere: str, libelle: str) -> None:
+        with self.verrou:
+            self.taches[cle] = {"cle": cle, "genre": genre, "matiere": matiere, "libelle": libelle,
+                                "statut": "attente", "avancement": 0.0, "detail": ""}
+
+    def maj_tache(self, cle: str, *, statut: Optional[str] = None,
+                  avancement: Optional[float] = None, detail: Optional[str] = None) -> None:
+        with self.verrou:
+            t = self.taches.get(cle)
+            if not t:
+                return
+            if statut is not None:
+                t["statut"] = statut
+            if avancement is not None:
+                t["avancement"] = max(0.0, min(1.0, float(avancement)))
+            if detail is not None:
+                t["detail"] = str(detail)[:160]
+        self.pousser(force=statut is not None)
+
+    def remarque(self, texte: str) -> None:
+        noter("année : " + texte)
+        with self.verrou:
+            if texte not in self.remarques:
+                self.remarques.append(texte)
+
+    def pousser(self, force: bool = False) -> None:
+        maintenant = time.time()
+        if not force and maintenant - self._dernier_envoi < 0.5:
+            return
+        self._dernier_envoi = maintenant
+        try:
+            self.notifier(self.instantane())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def instantane(self) -> dict[str, Any]:
+        with self.verrou:
+            return {"id": self.id, "genre": self.genre, "etat": self.etat, "erreur": self.erreur,
+                    "connexion": self.connexion,
+                    "remarques": list(self.remarques)[-30:],
+                    "taches": [dict(t) for t in self.taches.values()],
+                    "duree": int(time.time() - self.debut)}
+
+    def en_cours(self) -> bool:
+        return self.etat == "en_cours"
+
+    # -- déroulement ----------------------------------------------------------
+    def lancer(self) -> None:
+        threading.Thread(target=self._executer, daemon=True).start()
+
+    def arreter(self) -> None:
+        self.arret.set()
+        for e in list(self.etapes_claude):
+            if e.processus is not None:
+                tuer(e.processus, "arrêt demandé")
+        with self.cond:
+            self.cond.notify_all()
+
+    def _executer(self) -> None:
+        noter(f"année : chantier {self.genre} sur {self.annee.racine}")
+        try:
+            if self.genre == "horaire":
+                self._lire_horaire()
+            else:
+                self._planifier()
+                if self.genre == "word":
+                    self._refaire_word()
+                else:
+                    gpu = threading.Thread(target=self._fil_gpu, daemon=True)
+                    gpu.start()
+                    self._fil_claude()
+                    gpu.join()
+                    if not self.arret.is_set() and self.annee.ranger_traites():
+                        self._ranger()
+            with self.verrou:
+                for t in self.taches.values():
+                    if t["statut"] == "en_cours":
+                        t["statut"], t["detail"] = "attente", "interrompue"
+                self.etat = "arrete" if self.arret.is_set() else "fini"
+        except Exception as exc:  # noqa: BLE001
+            noter("année : échec — " + traceback.format_exc()[-800:])
+            self.connexion = self.connexion or isinstance(exc, ConnexionClaude)
+            self.etat, self.erreur = "erreur", _lisible(exc)
+        finally:
+            noter(f"année : chantier terminé ({self.etat})")
+            self.pousser(force=True)
+
+    def _ranger(self) -> None:
+        """Range les enregistrements déjà dans les fiches et les infos de leur
+        matière dans Traités\\AAAA-MM, les « pas un cours » et les doublons
+        dans Écartés : à la racine du dossier des audios ne restent que les
+        nouveaux. Le registre suit chaque audio : rien n'est refait."""
+        a = self.annee
+        try:
+            analyse = a.analyser()
+            transcriptions = a.transcriptions(analyse.infos)
+        except Exception as exc:  # noqa: BLE001
+            self.remarque(f"Rangement des audios impossible : {_lisible(exc)[:150]}")
+            return
+        etats: dict[str, Optional[suivi.EtatMatiere]] = {}
+        ranges: dict[str, int] = {}
+        for c in analyse.classements:
+            info = c.audio
+            if a.est_range(info.relatif):
+                continue
+            if c.ignore:
+                sous = an.DOSSIER_ECARTES
+            elif c.classe and analyse.horaire and (m := analyse.horaire.matiere(c.matiere)):
+                if c.matiere not in etats:
+                    dossier = a.dossier_matiere(m)
+                    seances = analyse.seances.get(m.nom, [])
+                    travail = dossier / TRAVAIL
+                    notes = {x.cle: travail / "seances" / f"{x.cle}.md" for x in seances}
+                    documents = {}
+                    for p in (a.supports_matiere(m) if dossier.is_dir() else []):
+                        documents[p.relative_to(dossier).as_posix()] = p
+                    etats[c.matiere] = etat_matiere(travail, notes, documents)
+                etat = etats[c.matiere]
+                fichier_notes = a.dossier_matiere(m) / TRAVAIL / "seances" / f"{c.seance}.md"
+                if not (etat and transcriptions.get(info.relatif, Path()).is_file()
+                        and etat.fiches.seance_integree(c.seance, fichier_notes)
+                        and etat.infos.seance_integree(c.seance, fichier_notes)):
+                    continue
+                sous = f"{an.DOSSIER_TRAITES}/{info.debut:%Y-%m}" if info.debut \
+                    else f"{an.DOSSIER_TRAITES}/sans date"
+            else:
+                continue
+            try:
+                a.deplacer_audio(info, sous)
+                ranges[sous.split("/")[0]] = ranges.get(sous.split("/")[0], 0) + 1
+            except OSError as exc:
+                self.remarque(f"{info.nom} : pas rangé ({exc})")
+        if ranges:
+            self.remarque("Rangés dans « " + a.dossier_audios().name + " » : " + ", ".join(
+                f"{n} dans {d}" for d, n in ranges.items()) + ". Ne restent à la racine que les nouveaux.")
+
+    def _options_claude(self, regles: entete.Consignes) -> dict[str, Any]:
+        """Le modèle de l'interface, sauf si les consignes de l'étape en
+        imposent un (bloc claude: de leur en-tête)."""
+        o = dict(self.options)
+        if regles.claude.get("modele"):
+            o["claude_modele"] = regles.claude["modele"]
+        if regles.claude.get("effort"):
+            o["claude_effort"] = regles.claude["effort"]
+        return o
+
+    def _atelier(self, nom: str) -> Path:
+        ATELIER.mkdir(parents=True, exist_ok=True)
+        for vieux in ATELIER.glob("annee-*"):
+            try:
+                if time.time() - vieux.stat().st_mtime > 24 * 3600:
+                    shutil.rmtree(vieux, ignore_errors=True)
+            except OSError:
+                pass
+        return Path(tempfile.mkdtemp(prefix=f"annee-{nom}-{time.strftime('%Y%m%d-%H%M%S')}-",
+                                     dir=ATELIER))
+
+    def _echec_claude(self, cle: str, exc: Exception) -> None:
+        if self.arret.is_set():
+            self.maj_tache(cle, statut="attente", detail="interrompue")
+            return
+        message = _lisible(exc)
+        libelle = self.taches.get(cle, {}).get("libelle", cle)
+        matiere = self.taches.get(cle, {}).get("matiere", "")
+        self.maj_tache(cle, statut="erreur", detail=message[:160])
+        self.remarque(f"{matiere} · {libelle} : {message[:300]}".lstrip(" ·"))
+        bloque = ""
+        if isinstance(exc, ConnexionClaude):
+            self.connexion = True
+            bloque = "Claude Code non connecté — connecte-le puis relance"
+        elif re.search(r"limite d.utilisation|usage limit|rate limit|\b429\b", message, re.I):
+            bloque = "limite Claude atteinte — relance plus tard"
+        if bloque:
+            self.claude_bloque = message
+            with self.verrou:
+                for t in self.taches.values():
+                    if t["genre"] in ("notes", "fiches", "infos") and t["statut"] == "attente":
+                        t["statut"], t["detail"] = "ignore", bloque
+
+    # -- horaire -------------------------------------------------------------
+    def _lire_horaire(self) -> None:
+        a = self.annee
+        src = a.source_horaire()
+        self.tache("h", "horaire", "", "Lecture de l'horaire")
+        if not src:
+            raise RuntimeError("Aucun horaire trouvé : dépose le fichier d'horaire (PDF, image, "
+                               f"Excel…) dans « {a.dossier_audios().name} », puis relance.")
+        self.maj_tache("h", statut="en_cours", detail=src.name)
+        ancien = a.charger_horaire()
+        ext = src.suffix.lower()
+        texte_extrait = ""
+        brut: Any = {}
+        if ext == ".json":
+            brut = json.loads(src.read_text(encoding="utf-8-sig"))
+            h = an.Horaire.depuis_dict(brut)
+        elif ext == ".ics":
+            h = an.horaire_depuis_ics(src.read_text(encoding="utf-8-sig", errors="replace"))
+        else:
+            def importer(nom: str, paquet: str) -> Any:
+                return module_requis(nom, paquet, lambda d: self.maj_tache("h", detail=d))
+            if ext == ".pdf":
+                try:
+                    pypdf = importer("pypdf", "pypdf")
+                    texte_extrait = "\n".join((pg.extract_text() or "")
+                                              for pg in pypdf.PdfReader(str(src)).pages)
+                except Exception as exc:  # noqa: BLE001
+                    noter(f"horaire : texte du PDF non extrait ({exc})")
+            else:
+                texte_extrait = an.horaire_en_texte(src, importer) or ""
+            consignes = consignes_annee(LECTURE_HORAIRE)
+            regles = entete.lire(consignes)
+            atelier = self._atelier("horaire")
+            lisible = ext in (".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif",
+                              ".tiff", ".heic", ".heif")
+            if lisible:
+                (atelier / "horaire").mkdir()
+                shutil.copyfile(src, atelier / "horaire" / f"horaire{ext}")
+            bloc = [f"Fichier d'origine : {src.name}"]
+            if lisible:
+                bloc.append(f"Fichier à lire avec Read : horaire/horaire{ext} (chemin complet : "
+                            f"{atelier / 'horaire' / ('horaire' + ext)})")
+            if texte_extrait.strip():
+                bloc += ["", "Texte extrait du fichier :", texte_extrait.strip()[:150_000]]
+            entree = atelier / "entree_claude.txt"
+            entree.write_text("<consignes>\n" + regles.corps.strip() + "\n</consignes>\n\n"
+                              "<horaire>\n" + "\n".join(bloc) + "\n</horaire>\n", encoding="utf-8")
+            etape = EtapeAnnee(self, "h", atelier, self._options_claude(regles), consignes)
+            etape.journal_claude = a.technique / "claude_horaire.log"
+            a.technique.mkdir(parents=True, exist_ok=True)
+            reponse, _ = executer_claude(etape, consigne_annee("horaire"), entree, Jalons({}),
+                                         outils=("Read",) if lisible else (), tours=8)
+            brut = an.json_dans(reponse)
+            h = an.Horaire.depuis_dict(brut)
+        if not h.matieres:
+            raise RuntimeError("Aucune matière lue dans l'horaire. "
+                               + ("; ".join(h.avertissements[:3]) if h.avertissements else ""))
+        h.source = src.name
+
+        # Contrôle d'un horaire daté : une séance lue par plage horaire du texte.
+        lues = len(brut.get("seances") or []) if isinstance(brut, dict) else 0
+        if texte_extrait and lues:
+            plages = len(re.findall(r"\b\d{1,2}[:hH]\d{2}\s*[-–]\s*\d{1,2}[:hH]\d{2}\b", texte_extrait))
+            if plages >= 10 and abs(plages - lues) > max(2, plages // 50):
+                self.remarque(f"Horaire : {lues} séances lues pour {plages} plages horaires dans "
+                              "le fichier — vérifie horaire.json (bouton « Modifier »).")
+        # Couleurs exactes : lues dans l'horaire lui-même (le fond de la case
+        # de chaque cours dans un PDF ; l'aplat le plus proche dans une image).
+        try:
+            if ext == ".pdf":
+                n = an.couleurs_depuis_pdf(src, h, module_requis(
+                    "pdfplumber", "pdfplumber", lambda d: self.maj_tache("h", detail=d)))
+                noter(f"horaire : {n} couleur(s) lue(s) dans le PDF")
+            elif ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"):
+                module_requis("PIL.Image", "pillow")
+                from PIL import Image
+                with Image.open(src) as image:
+                    n = an.affiner_couleurs(h, image)
+                noter(f"horaire : {n} couleur(s) recalée(s) sur l'image")
+        except Exception as exc:  # noqa: BLE001
+            noter(f"horaire : couleurs non recalées ({exc})")
+        # Les dossiers déjà choisis pour les matières sont gardés.
+        if ancien:
+            for m in h.matieres:
+                vieux = ancien.matiere(m.nom)
+                if vieux and vieux.dossier:
+                    m.dossier = vieux.dossier
+                if vieux and vieux.vocabulaire and not m.vocabulaire:
+                    m.vocabulaire = vieux.vocabulaire
+            try:
+                shutil.copyfile(a.horaire_json(), a.horaire_json().with_suffix(".json.bak"))
+            except OSError:
+                pass
+        a.dossier_audios().mkdir(parents=True, exist_ok=True)
+        a.retenir_dossier_audios(a.dossier_audios())
+        a.enregistrer_horaire(h)
+        for x in h.avertissements[:10]:
+            self.remarque(f"Horaire : {x}")
+        # Un dossier par matière, tout de suite (les dossiers existants au nom
+        # proche, comme « Psycho », sont repris).
+        try:
+            crees = a.creer_structure(a.charger_horaire())
+        except OSError as exc:
+            crees = []
+            self.remarque(f"Dossiers des matières non créés : {exc}")
+        seances = sum(len(c.dates) for c in h.creneaux)
+        self.maj_tache("h", statut="fait", avancement=1.0,
+                       detail=f"{len(h.matieres)} matières"
+                       + (f", {seances} séances datées" if seances else f", {len(h.creneaux)} créneaux")
+                       + (f" · {len(crees)} dossier(s) créé(s)" if crees else ""))
+
+    # -- planification ------------------------------------------------------
+    def _planifier(self) -> None:
+        a = self.annee
+        analyse = a.analyser()
+        h = analyse.horaire
+        if not h or not h.matieres:
+            raise RuntimeError("Pas encore d'horaire lu : clique d'abord « Lire l'horaire ».")
+        self.horaire = h
+        cibles = set(self.options.get("matieres") or [])
+        reecrire = bool(self.options.get("reecrire")) and bool(cibles)
+        if not cibles:
+            a_classer = [c for c in analyse.classements if not c.classe and not c.ignore]
+            if a_classer:
+                self.remarque(f"{len(a_classer)} enregistrement(s) à classer : choisis leur matière "
+                              "dans la liste des enregistrements, puis relance.")
+        transcriptions = a.transcriptions(analyse.infos, chercher=self.genre == "tout")
+        for m in h.matieres:
+            if cibles and m.nom not in cibles:
+                continue
+            seances = analyse.seances.get(m.nom, [])
+            dossier = a.dossier_matiere(m)
+            sources = a.supports_matiere(m)
+            if self.genre == "word":
+                if (dossier / TRAVAIL / "fiches.md").is_file() or (dossier / TRAVAIL / "infos.md").is_file():
+                    pm = _PlanMatiere(m, dossier, sources)
+                    self.plan.append(pm)
+                    self.tache(f"w:{m.nom}", "word", m.nom, "Remise en page Word")
+                continue
+            fiches = dossier / f"{nom_fichier_matiere(m)} - {an.FICHES}.docx"
+            infos = dossier / f"{nom_fichier_matiere(m)} - {an.INFOS}.docx"
+            # Sans enregistrement, une matière n'est rédigée qu'à la demande (bouton
+            # « Rédiger ») ; ensuite, « Tout traiter » suit ses nouveaux supports.
+            if not seances and not (sources and (cibles or fiches.is_file())):
+                continue
+            pm = _PlanMatiere(m, dossier, sources)
+            pm.reecrire = reecrire
+            self.plan.append(pm)
+            a_noter = False
+            for s in seances:
+                audios = [(c, transcriptions.get(c.audio.relatif) or a.transcription_de(c.audio.chemin))
+                          for c in s.audios]
+                ps = _PlanSeance(s, pm.travail / "seances" / f"{s.cle}.md", audios)
+                pm.seances.append(ps)
+                manquantes = [c for c, txt in audios if not txt.is_file()]
+                for c in manquantes:
+                    self.tache(f"t:{c.audio.relatif}", "transcription", m.nom,
+                               f"Transcription · {s.libelle} · {c.audio.nom}")
+                notes_perimees = ps.notes.is_file() and any(
+                    txt.is_file() and txt.stat().st_mtime > ps.notes.stat().st_mtime
+                    for _, txt in audios)
+                if manquantes or not ps.notes.is_file() or notes_perimees:
+                    a_noter = True
+                    self.tache(f"n:{m.nom}:{s.cle}", "notes", m.nom, f"Notes · {s.libelle}")
+            # Fiches et infos : seulement s'il y a du nouveau à y ajouter (une
+            # séance, un document), ou à refaire de zéro.
+            etat = pm.etat()
+            documents = pm.documents()
+            nouveau = any(not doc.seance_integree(ps.seance.cle, ps.notes)
+                          for ps in pm.seances for doc in (etat.fiches, etat.infos)) \
+                or any(not doc.support_integre(rel, chemin)
+                       for rel, chemin in documents.items() for doc in (etat.fiches, etat.infos))
+            if reecrire or a_noter or nouveau or not fiches.is_file() or not infos.is_file():
+                self.tache(f"f:{m.nom}", "fiches", m.nom,
+                           "Fiches résumés · tout réécrire" if reecrire else "Fiches résumés")
+                self.tache(f"i:{m.nom}", "infos", m.nom, "Infos importantes")
+            partis = sorted(set(etat.fiches.seances) - {ps.seance.cle for ps in pm.seances})
+            if partis and not reecrire:
+                self.remarque(f"{m.titre} : {len(partis)} séance(s) déjà dans les fiches n'ont plus "
+                              "d'enregistrement ici (reclassées ?). « Tout réécrire » les en retire.")
+        if not self.taches:
+            self.remarque("Tout est à jour : aucune nouvelle séance ni aucun nouveau support "
+                          "depuis le dernier passage.")
+        self.pousser(force=True)
+
+    # -- supports d'une matière ---------------------------------------------
+    def _preparer_supports(self, pm: _PlanMatiere, cle: str = "") -> None:
+        with self._verrou_supports:
+            if pm.supports is not None:
+                return
+            pm.supports = []
+            if not pm.sources:
+                return
+
+            def importer(nom: str, paquet: str) -> Any:
+                return module_requis(nom, paquet,
+                                     (lambda d: self.maj_tache(cle, detail=d)) if cle else None)
+            try:
+                supports, avert = sup.preparer(pm.sources, pm.travail / "supports", importer=importer,
+                                               extraire_texte=True, oublier_absents=True)
+                pm.supports = supports
+                pm.vocabulaire = sup.vocabulaire(supports, pm.travail / "supports")
+                for x in avert:
+                    self.remarque(f"{pm.m.titre} : {x}")
+            except Exception as exc:  # noqa: BLE001
+                self.remarque(f"{pm.m.titre} : supports non préparés ({_lisible(exc)[:150]})")
+
+    def _bloc_supports(self, pm: _PlanMatiere, atelier: Path, budget: int,
+                       seulement: Optional[list[str]] = None) -> str:
+        """Le bloc <supports> d'une matière ; les fichiers que Claude peut lire
+        sont copiés dans l'atelier (son répertoire de travail). `seulement` :
+        les documents à donner (chemins relatifs au dossier de la matière),
+        par défaut tous."""
+        supports_ = pm.supports or []
+        if seulement is not None:
+            voulus = set()
+            for rel in seulement:
+                try:
+                    voulus.add(str((pm.dossier / rel).resolve()))
+                except OSError:
+                    pass
+            supports_ = [x for x in supports_ if x.source in voulus]
+        if not supports_:
+            return ""
+        copie = atelier / "supports"
+        copie.mkdir(parents=True, exist_ok=True)
+        for s in supports_:
+            for nom in {s.fichier, s.texte} - {""}:
+                try:
+                    shutil.copyfile(pm.travail / "supports" / nom, copie / nom)
+                except OSError as exc:
+                    noter(f"support {nom} non copié : {exc}")
+        # Les documents sont désignés par leur place dans le dossier de la
+        # matière (un sous-dossier « Travail de groupe » dit ce qu'il contient).
+        chemins = {}
+        for p in pm.sources:
+            try:
+                chemins[p.name] = p.relative_to(pm.dossier).as_posix()
+            except ValueError:
+                chemins[p.name] = p.name
+        # Les documents rangés à la racine du dossier passent en premier.
+        ordre = {p.name: (len(p.relative_to(pm.dossier).parts) if p.is_relative_to(pm.dossier) else 9)
+                 for p in pm.sources}
+        supports = sorted(supports_, key=lambda s: ordre.get(s.origine, 9))
+        return sup.bloc_pour_claude(supports, pm.travail / "supports", racine=copie,
+                                    budget=budget, chemins=chemins,
+                                    intro="Documents rangés dans le dossier de la matière")
+
+    def _bloc_matiere(self, pm: _PlanMatiere) -> str:
+        m, h = pm.m, self.horaire
+        dates = [ps.seance.date for ps in pm.seances if ps.seance.date]
+        def periode(jours: list) -> str:
+            if not jours:
+                return ""
+            a, b = min(jours), max(jours)
+            return (f", le {an.date_fr(a, jour=False)}" if a == b else
+                    f", du {an.date_fr(a, jour=False)} au {an.date_fr(b, jour=False)}")
+        lignes = [f"Matière : {m.nom}" + (f" ({m.ue})" if m.ue else ""),
+                  f"Formation : {h.formation}" if h and h.formation else "",
+                  f"Enseignant(s) : {m.enseignant or 'non précisé'}",
+                  f"Séances enregistrées : {len(pm.seances)}" + periode(dates)]
+        if h:
+            prevues = sorted({x for c in h.creneaux_de(m.nom) for x in c.dates})
+            if prevues:
+                lignes.append(f"Séances prévues à l'horaire : {len(prevues)}" + periode(prevues))
+            elif h.creneaux_de(m.nom):
+                lignes.append("Créneaux : " + ", ".join(
+                    f"{an.JOURS[c.jour]} {c.plage}" for c in h.creneaux_de(m.nom)))
+        return "\n".join(x for x in lignes if x)
+
+    # -- les deux fils ---------------------------------------------------------
+    def _fil_gpu(self) -> None:
+        try:
+            for pm in self.plan:
+                for ps in pm.seances:
+                    for c, txt in ps.audios:
+                        cle = f"t:{c.audio.relatif}"
+                        if cle not in self.taches or self.taches[cle]["statut"] != "attente":
+                            continue
+                        if self.arret.is_set():
+                            return
+                        self.maj_tache(cle, statut="en_cours", detail="Préparation")
+                        self._preparer_supports(pm, cle)
+                        try:
+                            r = transcrire_robuste(
+                                c.audio.chemin, txt, modele=self.options.get("modele") or "large-v3",
+                                matiere=pm.m.nom, termes=pm.m.vocabulaire,
+                                vocabulaire_supports=pm.vocabulaire,
+                                debut=c.audio.debut if c.audio.precision == "heure" else None,
+                                signaler=lambda a, d, cle=cle: self.maj_tache(cle, avancement=a, detail=d),
+                                arret=self.arret)
+                            self.maj_tache(cle, statut="fait", avancement=1.0,
+                                           detail=f"{r['mots']} mots · {an.duree_lisible(r['duree'])}")
+                            try:
+                                self.annee.noter_transcription(c.audio, txt)
+                            except OSError as exc:
+                                noter(f"registre : {exc}")
+                        except Interrompu:
+                            self.maj_tache(cle, statut="attente", detail="interrompue")
+                            return
+                        except Exception as exc:  # noqa: BLE001
+                            noter("année : transcription — " + traceback.format_exc()[-600:])
+                            self.maj_tache(cle, statut="erreur", detail=_lisible(exc)[:160])
+                            self.remarque(f"{c.audio.nom} : {_lisible(exc)[:200]}")
+                            ps.echec = True
+                        finally:
+                            with self.cond:
+                                self.cond.notify_all()
+        finally:
+            with self.cond:
+                self.gpu_fini = True
+                self.cond.notify_all()
+
+    def _prochain(self) -> Optional[tuple[str, _PlanMatiere, Optional[_PlanSeance]]]:
+        """La prochaine rédaction possible : les notes d'une séance dont tous
+        les audios sont transcrits, puis les fiches d'une matière dont toutes
+        les séances ont leurs notes."""
+        if self.claude_bloque:
+            return None
+        for pm in self.plan:
+            if pm.echec:
+                continue
+            for ps in pm.seances:
+                t = self.taches.get(f"n:{pm.m.nom}:{ps.seance.cle}")
+                if not t or t["statut"] != "attente":
+                    continue
+                if not ps.echec and all(txt.is_file() for _, txt in ps.audios):
+                    return "notes", pm, ps
+            t = self.taches.get(f"f:{pm.m.nom}")
+            if t and t["statut"] == "attente":
+                bloquees = [ps for ps in pm.seances if ps.echec or self.taches.get(
+                    f"n:{pm.m.nom}:{ps.seance.cle}", {}).get("statut") in ("erreur", "ignore")]
+                if bloquees:
+                    pm.echec = True
+                    for cle in (f"f:{pm.m.nom}", f"i:{pm.m.nom}"):
+                        self.maj_tache(cle, statut="ignore",
+                                       detail=f"séance du {bloquees[0].seance.libelle} en échec")
+                    continue
+                pretes = all(all(txt.is_file() for _, txt in ps.audios) and ps.notes.is_file()
+                             and self.taches.get(f"n:{pm.m.nom}:{ps.seance.cle}", {}).get(
+                                 "statut", "fait") == "fait" for ps in pm.seances)
+                if pretes:
+                    return "fiches", pm, None
+        return None
+
+    def _fil_claude(self) -> None:
+        while not self.arret.is_set():
+            with self.cond:
+                travail = self._prochain()
+                if travail is None:
+                    if self.gpu_fini:
+                        # Plus rien ne peut se débloquer : ce qui attend encore
+                        # dépend d'une étape en échec.
+                        for t in self.taches.values():
+                            if t["genre"] in ("notes", "fiches", "infos") and t["statut"] == "attente":
+                                t["statut"] = "ignore"
+                                t["detail"] = t["detail"] or "dépend d'une étape en échec"
+                        return
+                    self.cond.wait(2)
+                    continue
+            genre, pm, ps = travail
+            if genre == "notes":
+                self._notes(pm, ps)
+            else:
+                self._fiches(pm)
+
+    # -- rédactions ------------------------------------------------------------
+    def _notes(self, pm: _PlanMatiere, ps: _PlanSeance) -> None:
+        cle = f"n:{pm.m.nom}:{ps.seance.cle}"
+        self.maj_tache(cle, statut="en_cours", detail="Préparation")
+        try:
+            self._preparer_supports(pm, cle)
+            consignes = consignes_annee(NOTES_SEANCE)
+            regles = entete.lire(consignes)
+            atelier = self._atelier("notes")
+            morceaux = []
+            for i, (c, txt) in enumerate(ps.audios, 1):
+                quand = (f" · début {c.audio.debut:%H:%M}" if c.audio.debut and c.audio.precision == "heure"
+                         else "")
+                morceaux.append(f"=== Enregistrement {i}/{len(ps.audios)} — {c.audio.nom}{quand}"
+                                f" · {an.duree_lisible(c.audio.duree) or 'durée inconnue'} ===\n"
+                                + texte_de_transcription(txt))
+            titres = ps.seance.titres
+            seance = "\n".join(x for x in (
+                self._bloc_matiere(pm).split("\n")[0],
+                f"Formation : {self.horaire.formation}" if self.horaire and self.horaire.formation else "",
+                f"Enseignant(s) : {pm.m.enseignant or 'non précisé'}",
+                f"Date : {ps.seance.libelle}",
+                f"Enregistrements : {len(ps.audios)}",
+                ("Titres donnés par l'enregistreur : " + " ; ".join(titres)) if titres else "",
+            ) if x)
+            entree = atelier / "entree_claude.txt"
+            entree.write_text(
+                "<consignes>\n" + regles.corps.strip() + "\n</consignes>\n\n"
+                "<seance>\n" + seance + "\n</seance>\n\n"
+                "<vocabulaire>\n" + (", ".join(x for x in (pm.m.vocabulaire, pm.vocabulaire) if x) or "—")
+                + "\n</vocabulaire>\n\n"
+                "<transcription>\n" + "\n\n".join(morceaux) + "\n</transcription>\n", encoding="utf-8")
+            etape = EtapeAnnee(self, cle, pm.travail, self._options_claude(regles), consignes)
+            md, usage = executer_claude(etape, consigne_annee("notes"), entree, Jalons({}), tours=6)
+            if len(md.split()) < 40:
+                raise RuntimeError(f"Notes presque vides ({len(md.split())} mots). Détail : claude.log "
+                                   f"dans « {pm.travail} ».")
+            ecrire_atomique(ps.notes, md.strip() + "\n")
+            self.maj_tache(cle, statut="fait", avancement=1.0,
+                           detail=f"{len(md.split())} mots" + (f" · {usage['modele']}" if usage.get("modele") else ""))
+        except Exception as exc:  # noqa: BLE001
+            noter("année : notes — " + traceback.format_exc()[-600:])
+            ps.echec = not self.arret.is_set()
+            self._echec_claude(cle, exc)
+        finally:
+            with self.cond:
+                self.cond.notify_all()
+
+    def _sous_titre(self, pm: _PlanMatiere) -> str:
+        """« Dupont, Martin · 12 séances enregistrées · 8 septembre – 16 décembre 2026 »."""
+        dates = [ps.seance.date for ps in pm.seances if ps.seance.date]
+        n = len(pm.seances)
+        morceaux = [pm.m.enseignant,
+                    f"{n} séance{'s' if n > 1 else ''} enregistrée{'s' if n > 1 else ''}" if n else ""]
+        if dates:
+            a, b = min(dates), max(dates)
+            morceaux.append(an.date_fr(a, jour=False) if a == b else
+                            f"{an.date_fr(a, jour=False, annee=a.year != b.year)} – "
+                            f"{an.date_fr(b, jour=False)}")
+        return " · ".join(x for x in morceaux if x)
+
+    def _sous_titre_infos(self, pm: _PlanMatiere) -> str:
+        """« Dupont · Bachelier en éducation spécialisée »."""
+        return " · ".join(x for x in (pm.m.enseignant, self.horaire.formation if self.horaire else "") if x)
+
+    def _fiches(self, pm: _PlanMatiere) -> None:
+        """Fiches résumés d'une matière : les séances et documents qui n'y sont
+        pas encore y sont ajoutés (Claude complète les catégories concernées) ;
+        sans fiches, ou pour « Tout réécrire », elles sont rédigées de zéro,
+        par lots de séances si la matière est longue. Puis les infos."""
+        cf, ci = f"f:{pm.m.nom}", f"i:{pm.m.nom}"
+        self.maj_tache(cf, statut="en_cours", detail="Préparation")
+        etat = pm.etat()
+        notes: dict[str, tuple[_PlanSeance, str]] = {}
+        try:
+            self._preparer_supports(pm, cf)
+            for ps in pm.seances:
+                if ps.notes.is_file():
+                    notes[ps.seance.cle] = (ps, ps.notes.read_text(encoding="utf-8", errors="replace"))
+            if not notes and not pm.supports:
+                raise RuntimeError("ni séance enregistrée ni support dans le dossier de la matière")
+            md_fiches = pm.travail / "fiches.md"
+            if pm.reecrire and md_fiches.is_file():
+                sauvegarder_version(md_fiches, pm.travail / "versions")
+            existant = "" if pm.reecrire else (
+                md_fiches.read_text(encoding="utf-8", errors="replace") if md_fiches.is_file() else "")
+            if not existant.strip():
+                etat.fiches.vider()
+            documents = pm.documents()
+            nouvelles = [cle for cle, (ps, _) in notes.items()
+                         if not etat.fiches.seance_integree(cle, ps.notes)]
+            docs = [rel for rel, chemin in documents.items()
+                    if not etat.fiches.support_integre(rel, chemin)]
+            sortie = pm.dossier / f"{nom_fichier_matiere(pm.m)} - {an.FICHES}.docx"
+            if not nouvelles and not docs and existant.strip():
+                detail = "rien de nouveau"
+            else:
+                tailles = [(cle, len(notes[cle][1])) for cle in nouvelles]
+                paquets = suivi.lots(tailles, BUDGET_NOTES_LOT) or [[]]
+                for i, paquet in enumerate(paquets):
+                    if self.arret.is_set():
+                        return
+                    if len(paquets) > 1:
+                        self.maj_tache(cf, avancement=i / len(paquets),
+                                       detail=f"Lot {i + 1}/{len(paquets)} · {len(paquet)} séance(s)")
+                    docs_lot = docs if i == 0 else []
+                    complet = not existant.strip()
+                    md = self._rediger_fiches(pm, cf, existant, [notes[c] for c in paquet], docs_lot,
+                                              revues=[c for c in paquet if c in etat.fiches.seances])
+                    ecrire_atomique(md_fiches, md)
+                    existant = md
+                    le = suivi.maintenant()
+                    if complet:
+                        etat.fiches.vider()
+                        etat.fiches.complet = le
+                    else:
+                        etat.fiches.ajouts += 1
+                    for cle in paquet:
+                        etat.fiches.noter_seance(cle, notes[cle][0].notes, notes[cle][1], le)
+                    for rel in docs_lot:
+                        etat.fiches.noter_support(rel, documents[rel], le)
+                    etat.sauver()
+                detail = (f"{len(nouvelles)} séance(s)" if nouvelles else "") + \
+                    (" et " if nouvelles and docs else "") + (f"{len(docs)} document(s)" if docs else "")
+                detail = ("réécrites : " if pm.reecrire else "ajout : ") + (detail or "rédaction")
+            if detail != "rien de nouveau" or not sortie.is_file():
+                self.maj_tache(cf, avancement=0.95, detail="Mise en page Word")
+                ecrit, avert = produire_word(md_fiches, sortie, consignes_annee(FICHES_MATIERE), pm.m,
+                                             sous_titre=self._sous_titre(pm), travail=pm.travail)
+                for x in avert:
+                    self.remarque(f"{pm.m.titre} : {x}")
+            self.maj_tache(cf, statut="fait", avancement=1.0,
+                           detail=f"{detail} · {suivi.mots(existant)} mots")
+        except Exception as exc:  # noqa: BLE001
+            noter("année : fiches — " + traceback.format_exc()[-600:])
+            self._echec_claude(cf, exc)
+            if not self.arret.is_set():
+                self.maj_tache(ci, statut="ignore", detail="fiches en échec")
+            return
+        finally:
+            with self.cond:
+                self.cond.notify_all()
+        if self.arret.is_set():
+            return
+        self._infos(pm, list(notes.values()), etat)
+
+    def _rediger_fiches(self, pm: _PlanMatiere, cle: str, existant: str,
+                        seances: list[tuple[_PlanSeance, str]], docs: list[str],
+                        revues: list[str]) -> str:
+        """Un passage de Claude sur les fiches : rédaction complète (pas de
+        fiches existantes) ou ajout des `seances` et `docs` aux fiches
+        existantes, découpées en une partie par catégorie dans l'atelier."""
+        consignes = consignes_annee(FICHES_MATIERE)
+        regles = entete.lire(consignes)
+        atelier = self._atelier("fiches")
+        ajout = bool(existant.strip())
+        avant = suivi.mots(existant)
+        if ajout:
+            for nom, texte in suivi.nommer(suivi.decouper(existant)).items():
+                (atelier / nom).write_text(texte, encoding="utf-8")
+        blocs_notes = "\n\n".join(f'<seance date="{ps.seance.date or "inconnue"}">\n'
+                                  f"{texte.strip()}\n</seance>" for ps, texte in seances)
+        bloc_sup = self._bloc_supports(pm, atelier, BUDGET_SUPPORTS_FICHES, seulement=docs)
+        if ajout:
+            quoi = " et ".join(x for x in (
+                f"{len(seances)} séance(s)" if seances else "",
+                f"{len(docs)} document(s) du dossier de la matière" if docs else "") if x)
+            libelles = {ps.seance.cle: ps.seance.libelle for ps, _ in seances}
+            mission = MISSION_AJOUT_FICHES.format(
+                atelier=atelier, plan=suivi.plan(suivi.parties_dans(atelier)), quoi=quoi or "rien",
+                lexique=suivi.LEXIQUE,
+                revues=("\n6. Déjà intégrée(s) auparavant, avec des notes depuis revues : "
+                        + ", ".join(libelles.get(c, c) for c in revues)
+                        + ". Corrige ce qui la concerne, sans rien dupliquer.") if revues else "")
+            tete = "<mission>\n" + mission + "\n</mission>\n\n"
+        else:
+            tete = ("<sortie>\nÉcris les fichiers 010.md, 020.md… et 990.md (lexique) dans ce "
+                    f"dossier (le répertoire courant) : {atelier}\n</sortie>\n\n")
+        entree = atelier / "entree_claude.txt"
+        entree.write_text(
+            "<consignes>\n" + regles.corps.strip() + "\n</consignes>\n\n" + tete
+            + "<matiere>\n" + self._bloc_matiere(pm) + "\n</matiere>\n\n"
+            + "<notes>\n" + (blocs_notes or ("Aucune nouvelle séance." if ajout else
+                                             "Aucune séance enregistrée : rédige à partir des supports."))
+            + "\n</notes>\n\n" + (bloc_sup + "\n" if bloc_sup else ""), encoding="utf-8")
+        etape = EtapeAnnee(self, cle, pm.travail, self._options_claude(regles), consignes)
+        etape.supports = pm.supports or []
+        lectures = len(sup.a_lire(pm.supports or []))
+        reponse, usage = executer_claude(etape, consigne_annee("fiches_ajout" if ajout else "fiches"),
+                                         entree, Jalons({}), outils=("Read", "Write", "Edit"),
+                                         tours=min(150, 60 + 2 * lectures))
+        parties = suivi.parties_dans(atelier)
+        md = suivi.assembler(parties) if parties else reponse.strip() + "\n"
+        lieu = f"Détail : claude.log dans « {pm.travail} »."
+        if not ajout:
+            if suivi.mots(md) < 150:
+                raise RuntimeError(f"Claude n'a pas écrit les fiches ({suivi.mots(md)} mots). {lieu}")
+            return md
+        if suivi.mots(md) < 0.9 * avant:
+            raise RuntimeError(f"Les fiches complétées sont plus courtes que les précédentes "
+                               f"({suivi.mots(md)} mots contre {avant}) : elles n'ont pas été "
+                               f"remplacées. {lieu}")
+        inchange = re.sub(r"\s+", " ", md).strip() == re.sub(r"\s+", " ", existant).strip()
+        if inchange and "RIEN" not in reponse.upper():
+            raise RuntimeError(f"Claude n'a rien ajouté aux fiches. {lieu}")
+        return md
+
+    def _infos(self, pm: _PlanMatiere, notes: list[tuple[_PlanSeance, str]],
+               etat: suivi.EtatMatiere) -> bool:
+        """La fiche « Infos importantes » : complétée avec les informations des
+        nouvelles séances et des nouveaux documents, ou rédigée de zéro."""
+        ci = f"i:{pm.m.nom}"
+        self.maj_tache(ci, statut="en_cours", detail="Préparation")
+        try:
+            consignes = consignes_annee(INFOS_MATIERE)
+            regles = entete.lire(consignes)
+            md_infos = pm.travail / "infos.md"
+            existant = "" if pm.reecrire else (
+                md_infos.read_text(encoding="utf-8", errors="replace") if md_infos.is_file() else "")
+            if not existant.strip():
+                etat.infos.vider()
+            documents = pm.documents()
+            nouvelles = [(ps, texte) for ps, texte in notes
+                         if not etat.infos.seance_integree(ps.seance.cle, ps.notes)]
+            docs = [rel for rel, chemin in documents.items()
+                    if not etat.infos.support_integre(rel, chemin)]
+            sortie = pm.dossier / f"{nom_fichier_matiere(pm.m)} - {an.INFOS}.docx"
+            if not nouvelles and not docs and existant.strip():
+                if not sortie.is_file():
+                    produire_word(md_infos, sortie, consignes, pm.m,
+                                  sous_titre=self._sous_titre_infos(pm), travail=pm.travail)
+                self.maj_tache(ci, statut="fait", avancement=1.0, detail="rien de nouveau")
+                return True
+            atelier = self._atelier("infos")
+            releves = []
+            for ps, texte in nouvelles:
+                infos = section_markdown(texte, "Infos pratiques et examen") or "Néant."
+                signaux = [l.strip() for l in texte.splitlines() if "🎯" in l]
+                releves.append(f"### Séance du {ps.seance.libelle}\n{infos}"
+                               + ("\n\nPoints sur lesquels l'enseignant a insisté :\n" + "\n".join(signaux)
+                                  if signaux else ""))
+            bloc_sup = self._bloc_supports(pm, atelier, BUDGET_SUPPORTS_INFOS, seulement=docs)
+            ajout = bool(existant.strip())
+            tete = ""
+            if ajout:
+                quoi = " et ".join(x for x in (
+                    f"{len(nouvelles)} séance(s)" if nouvelles else "",
+                    f"{len(docs)} document(s)" if docs else "") if x)
+                tete = ("<mission>\n" + MISSION_AJOUT_INFOS.format(quoi=quoi) + "\n</mission>\n\n"
+                        "<infos_actuelles>\n" + existant.strip() + "\n</infos_actuelles>\n\n")
+            entree = atelier / "entree_claude.txt"
+            entree.write_text(
+                "<consignes>\n" + regles.corps.strip() + "\n</consignes>\n\n" + tete
+                + "<matiere>\n" + self._bloc_matiere(pm) + "\n</matiere>\n\n"
+                "<infos>\n" + ("\n\n".join(releves) or ("Aucune nouvelle séance." if ajout
+                                                       else "Aucune séance enregistrée."))
+                + "\n</infos>\n\n" + (bloc_sup + "\n" if bloc_sup else ""), encoding="utf-8")
+            etape = EtapeAnnee(self, ci, pm.travail, self._options_claude(regles), consignes)
+            lectures = len(sup.a_lire(pm.supports or []))
+            md, usage = executer_claude(etape, consigne_annee("infos_ajout" if ajout else "infos"),
+                                        entree, Jalons({}), outils=("Read",) if lectures else (),
+                                        tours=6 + lectures)
+            if suivi.mots(md) < 30:
+                raise RuntimeError(f"Fiche presque vide ({suivi.mots(md)} mots).")
+            if ajout and suivi.mots(md) < 0.6 * suivi.mots(existant):
+                raise RuntimeError(f"La fiche mise à jour a perdu une grande partie de son contenu "
+                                   f"({suivi.mots(md)} mots contre {suivi.mots(existant)}) : elle n'a "
+                                   "pas été remplacée.")
+            if pm.reecrire and md_infos.is_file():
+                sauvegarder_version(md_infos, pm.travail / "versions")
+            ecrire_atomique(md_infos, md.strip() + "\n")
+            le = suivi.maintenant()
+            if ajout:
+                etat.infos.ajouts += 1
+            else:
+                etat.infos.vider()
+                etat.infos.complet = le
+            for ps, texte in nouvelles:
+                etat.infos.noter_seance(ps.seance.cle, ps.notes, texte, le)
+            for rel in docs:
+                etat.infos.noter_support(rel, documents[rel], le)
+            etat.sauver()
+            self.maj_tache(ci, avancement=0.9, detail="Mise en page Word")
+            ecrit, avert = produire_word(md_infos, sortie, consignes, pm.m,
+                                         sous_titre=self._sous_titre_infos(pm), travail=pm.travail)
+            for x in avert:
+                self.remarque(f"{pm.m.titre} : {x}")
+            self.maj_tache(ci, statut="fait", avancement=1.0,
+                           detail=("mise à jour · " if ajout else "") + f"{suivi.mots(md)} mots · {ecrit.name}")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            noter("année : infos — " + traceback.format_exc()[-600:])
+            self._echec_claude(ci, exc)
+            return False
+
+    def _refaire_word(self) -> None:
+        """Remise en page des documents Word depuis les .md déjà rédigés, avec
+        l'en-tête docx: actuel des consignes : sans relancer Claude."""
+        analyse = self.annee.analyser()
+        for pm in self.plan:
+            if self.arret.is_set():
+                return
+            cle = f"w:{pm.m.nom}"
+            self.maj_tache(cle, statut="en_cours", detail="Mise en page")
+            seances = analyse.seances.get(pm.m.nom, [])
+            pm.seances = [_PlanSeance(s, pm.travail / "seances" / f"{s.cle}.md", []) for s in seances]
+            faits = []
+            try:
+                for nom_md, modele, suffixe, sous_titre in (
+                        ("fiches.md", FICHES_MATIERE, an.FICHES, self._sous_titre(pm)),
+                        ("infos.md", INFOS_MATIERE, an.INFOS, self._sous_titre_infos(pm))):
+                    md = pm.travail / nom_md
+                    if not md.is_file():
+                        continue
+                    ecrit, avert = produire_word(md, pm.dossier / f"{nom_fichier_matiere(pm.m)} - {suffixe}.docx",
+                                                 consignes_annee(modele), pm.m, sous_titre=sous_titre,
+                                                 travail=pm.travail)
+                    faits.append(ecrit.name)
+                    for x in avert:
+                        self.remarque(f"{pm.m.titre} : {x}")
+                self.maj_tache(cle, statut="fait", avancement=1.0, detail=" · ".join(faits) or "rien à refaire")
+            except Exception as exc:  # noqa: BLE001
+                self.maj_tache(cle, statut="erreur", detail=_lisible(exc)[:160])
+                self.remarque(f"{pm.m.titre} : {_lisible(exc)[:200]}")
+
+
+def _date_courte(iso: str) -> str:
+    """« 2026-11-23T09:12:00 » -> « 23/11/2026 »."""
+    try:
+        return datetime.datetime.fromisoformat(iso).strftime("%d/%m/%Y") if iso else ""
+    except ValueError:
+        return iso[:10]
+
+
+def _quand(chemin: Path) -> Optional[str]:
+    try:
+        return datetime.datetime.fromtimestamp(chemin.stat().st_mtime).strftime("%d/%m/%Y %H:%M")
+    except OSError:
+        return None
+
+
+def instantane_annee(a: an.Annee, chantier: Optional[Chantier]) -> dict[str, Any]:
+    """Tout ce que l'écran « année » affiche : dossiers, horaire, matières,
+    enregistrements et leur classement, traitement en cours."""
+    analyse = a.analyser()
+    h = analyse.horaire
+    src = a.source_horaire()
+    hj = a.horaire_json()
+    dossier_audios = a.dossier_audios()
+    sortie: dict[str, Any] = {
+        "chemin": str(a.racine), "nom": a.racine.name, "existe": a.racine.is_dir(),
+        "audios": {"dossier": dossier_audios.name, "existe": dossier_audios.is_dir(),
+                   "chemin": str(dossier_audios)},
+        "a_ranger": [p.name for p in a.a_ranger()],
+        "horaire": {
+            "source": src.name if src else "", "lu": hj.is_file(), "chemin_json": str(hj),
+            "perime": bool(src and hj.is_file() and src.stat().st_mtime > hj.stat().st_mtime + 1),
+            "formation": h.formation if h else "", "annee": h.annee if h else "",
+            "avertissements": (h.avertissements if h else [])[:8]},
+        "remarques": analyse.remarques,
+        "consignes": str(CONSIGNES_ANNEE),
+        "ranger": a.ranger_traites(),
+        "chantier": chantier.instantane() if chantier else None,
+        "matieres": [], "enregistrements": [],
+    }
+    if h and h.periode():
+        p0, p1 = h.periode()
+        sortie["horaire"]["periode"] = f"du {an.date_fr(p0, jour=False)} au {an.date_fr(p1, jour=False)}"
+
+    chemins_t = a.transcriptions(analyse.infos)
+    transcrits = {rel: t.is_file() for rel, t in chemins_t.items()}
+    # Séance -> date à laquelle elle est entrée dans les fiches et les infos
+    # (les deux), ou absente.
+    integrees: dict[tuple[str, str], str] = {}
+    notes_faites: set[tuple[str, str]] = set()
+    if h:
+        for m in h.matieres:
+            dossier = a.dossier_matiere(m)
+            travail = dossier / TRAVAIL
+            seances = analyse.seances.get(m.nom, [])
+            audios = [c for s in seances for c in s.audios]
+            sources = a.supports_matiere(m) if dossier.is_dir() else []
+            notes = {s.cle: travail / "seances" / f"{s.cle}.md" for s in seances}
+            documents = {}
+            for p in sources:
+                documents[p.relative_to(dossier).as_posix()] = p
+            fiches = dossier / f"{nom_fichier_matiere(m)} - {an.FICHES}.docx"
+            infos = dossier / f"{nom_fichier_matiere(m)} - {an.INFOS}.docx"
+            etat = etat_matiere(travail, notes, documents)
+            dans_fiches = 0
+            for s in seances:
+                n = notes[s.cle]
+                if n.is_file():
+                    notes_faites.add((m.nom, s.cle))
+                    if etat.fiches.seance_integree(s.cle, n) and etat.infos.seance_integree(s.cle, n):
+                        integrees[(m.nom, s.cle)] = etat.fiches.date_seance(s.cle)
+                        dans_fiches += 1
+            docs_a_jour = all(etat.fiches.support_integre(r, q) and etat.infos.support_integre(r, q)
+                              for r, q in documents.items())
+            a_jour = (fiches.is_file() and infos.is_file() and dans_fiches == len(seances)
+                      and all(transcrits.get(c.audio.relatif) for c in audios) and docs_a_jour)
+            sortie["matieres"].append({
+                "nom": m.nom, "court": m.titre, "ue": m.ue, "couleur": m.couleur,
+                "encre": an.texte_sur(m.couleur), "fonce": an.foncee(m.couleur, 0.2),
+                "enseignant": m.enseignant, "dossier": dossier.name, "dossier_existe": dossier.is_dir(),
+                "chemin": str(dossier), "prevues": h.seances_prevues(m.nom), "seances": len(seances),
+                "audios": len(audios), "transcrits": sum(1 for c in audios if transcrits.get(c.audio.relatif)),
+                "notes": sum(1 for n in notes.values() if n.is_file()), "supports": len(sources),
+                "dans_fiches": dans_fiches, "nouvelles": len(seances) - dans_fiches,
+                "docs_nouveaux": 0 if docs_a_jour else sum(
+                    1 for r, q in documents.items()
+                    if not (etat.fiches.support_integre(r, q) and etat.infos.support_integre(r, q))),
+                "ajouts": etat.fiches.ajouts, "complet": etat.fiches.complet[:10],
+                "fiches": {"chemin": str(fiches), "date": _quand(fiches)} if fiches.is_file() else None,
+                "infos": {"chemin": str(infos), "date": _quand(infos)} if infos.is_file() else None,
+                "a_jour": bool(a_jour and (seances or sources))})
+
+    def cle_tri(c: an.Classement) -> tuple:
+        return (c.audio.debut is None, c.audio.debut or datetime.datetime.max, c.audio.nom)
+    for c in sorted(analyse.classements, key=cle_tri):
+        d = c.audio.debut
+        transcrit = transcrits.get(c.audio.relatif, False)
+        integre = integrees.get((c.matiere, c.seance), "") if c.classe else ""
+        if c.doublon:
+            etape = "doublon"
+        elif c.ignore:
+            etape = "ecarte"
+        elif not c.classe:
+            etape = "a_classer"
+        elif integre and transcrit:
+            etape = "fiches"
+        elif transcrit and (c.matiere, c.seance) in notes_faites:
+            etape = "notes"
+        elif transcrit:
+            etape = "transcrit"
+        else:
+            etape = "nouveau"
+        rangement = c.audio.relatif.rsplit("/", 1)[0] if a.est_range(c.audio.relatif) else ""
+        sortie["enregistrements"].append({
+            "relatif": c.audio.relatif, "nom": c.audio.nom, "titre": c.audio.titre,
+            "date": f"{d:%d/%m/%Y}" if d else "", "jour": an.JOURS[d.weekday()] if d else "",
+            "heure": f"{d:%H:%M}" if d and c.audio.precision == "heure" else "",
+            "mois": f"{d:%Y-%m}" if d else "", "mois_libelle": f"{an.MOIS[d.month - 1]} {d.year}" if d else "",
+            "source": c.audio.source, "duree": an.duree_lisible(c.audio.duree),
+            "matiere": c.matiere, "confiance": c.confiance, "raison": c.raison,
+            "ignore": c.ignore, "doublon": c.doublon, "transcrit": transcrit,
+            "seance": c.seance, "etape": etape,
+            "integre": _date_courte(integre),
+            "range": rangement})
+    return sortie
+
+
+def choisir_dossier_natif(titre: str) -> Optional[str]:
+    """Boîte « Rechercher un dossier » de Windows, sur un thread STA comme la
+    boîte « Ouvrir » (voir choisir_fichier_natif). Lecteurs réseau compris."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BROWSEINFOW(ctypes.Structure):
+        _fields_ = [("hwndOwner", wintypes.HWND), ("pidlRoot", ctypes.c_void_p),
+                    ("pszDisplayName", wintypes.LPWSTR), ("lpszTitle", wintypes.LPCWSTR),
+                    ("ulFlags", wintypes.UINT), ("lpfn", ctypes.c_void_p),
+                    ("lParam", wintypes.LPARAM), ("iImage", ctypes.c_int)]
+
+    issue: dict[str, Any] = {}
+
+    def _montrer() -> None:
+        ole32 = ctypes.windll.ole32
+        ole32.OleInitialize(None)
+        try:
+            nom = ctypes.create_unicode_buffer(260)
+            bi = BROWSEINFOW()
+            bi.hwndOwner = _HANDLE_FENETRE.get("hwnd") or None
+            bi.pszDisplayName = ctypes.cast(nom, wintypes.LPWSTR)
+            bi.lpszTitle = titre
+            bi.ulFlags = 0x0001 | 0x0010 | 0x0040      # RETURNONLYFSDIRS | EDITBOX | NEWDIALOGSTYLE
+            shell32 = ctypes.windll.shell32
+            shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+            shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR]
+            pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
+            if pidl:
+                chemin = ctypes.create_unicode_buffer(32768)
+                if shell32.SHGetPathFromIDListW(ctypes.c_void_p(pidl), chemin):
+                    issue["chemin"] = chemin.value
+                ole32.CoTaskMemFree(ctypes.c_void_p(pidl))
+        except Exception as exc:  # noqa: BLE001
+            issue["erreur"] = str(exc)
+        finally:
+            ole32.OleUninitialize()
+
+    fil = threading.Thread(target=_montrer, daemon=True)
+    fil.start()
+    fil.join(600)
+    if fil.is_alive():
+        raise RuntimeError("la boîte de dialogue ne répond pas")
+    if "erreur" in issue:
+        raise RuntimeError(issue["erreur"])
+    return issue.get("chemin")
+
+
+# ----------------------------------------------------------------------
 # Passerelle exposée à l'interface
 # ----------------------------------------------------------------------
 class Passerelle:
@@ -1547,6 +3155,8 @@ class Passerelle:
     def __init__(self):
         self._fenetre = None
         self._courant: Optional[Traitement] = None
+        self._annee: Optional[an.Annee] = None          # mode année : dossier ouvert
+        self._chantier: Optional[Chantier] = None       # et son traitement
 
     # -- appelée depuis le JavaScript ---------------------------------
     def choisir_fichier(self) -> Optional[dict[str, Any]]:
@@ -1660,6 +3270,19 @@ class Passerelle:
         ouvrir_fichier(t.consignes, modifier=True)
         return {}
 
+    def connecter_claude(self) -> dict[str, Any]:
+        """« Se connecter à Claude » : une console lance claude auth login ;
+        à sa fermeture, l'état de connexion est relu et affiché."""
+        try:
+            return ouvrir_connexion_claude(
+                apres=lambda: verifier_connexion(self._pousser_claude))
+        except Exception as exc:  # noqa: BLE001
+            noter("claude : connexion impossible à ouvrir — " + str(exc))
+            return {"erreur": f"Impossible d'ouvrir la connexion : {exc}"}
+
+    def verifier_connexion_claude(self) -> dict[str, str]:
+        return verifier_connexion()
+
     def etat_claude(self) -> dict[str, str]:
         """Où en est la vérification de Claude Code lancée au démarrage."""
         return dict(_ETAT_CLAUDE)
@@ -1711,6 +3334,9 @@ class Passerelle:
         source = Path(options.get("chemin", ""))
         if not source.exists():
             return {"erreur": "Fichier introuvable."}
+        if self._chantier and self._chantier.en_cours():
+            return {"erreur": "Un traitement d'année est en cours (mode année) : attends sa fin "
+                              "ou arrête-le avant de lancer un cours seul."}
         try:
             consignes = chemin_consignes(options.get("consignes") or "")
         except FileNotFoundError as exc:
@@ -1754,7 +3380,7 @@ class Passerelle:
         if not transcription.exists():
             return {"erreur": "transcription.txt est introuvable : relance le cours "
                               "depuis l'audio."}
-        t.etat, t.erreur, t.usage = "en_cours", None, {}
+        t.etat, t.erreur, t.usage, t.connexion = "en_cours", None, {}, False
         t.fichiers = {"txt": str(transcription)}
         t.avertissements = []
         for nom in ("synthese", "pdf"):
@@ -1847,6 +3473,185 @@ class Passerelle:
                          daemon=True).start()
         return t.instantane()
 
+    # -- mode année ------------------------------------------------------
+    def annee_initiale(self) -> dict[str, Any]:
+        """La dernière année ouverte et le dernier modèle de transcription."""
+        r = lire_reglages()
+        return {"chemin": r.get("annee_chemin", ""), "modele": r.get("annee_modele", "large-v3"),
+                "mode": r.get("mode", "cours")}
+
+    def retenir_mode(self, mode: str) -> bool:
+        """Le mode affiché (un cours / une année) est retrouvé au lancement suivant."""
+        ecrire_reglages(mode="annee" if mode == "annee" else "cours")
+        return True
+
+    def choisir_dossier_annee(self) -> Optional[str]:
+        noter("appel choisir_dossier_annee")
+        if os.name == "nt":
+            try:
+                return choisir_dossier_natif("Choisis le dossier de l'année (par exemple « Année 1 »)")
+            except Exception as exc:  # noqa: BLE001
+                noter(f"boîte « dossier » native indisponible ({exc}), repli sur pywebview")
+        import webview
+        r = self._fenetre.create_file_dialog(webview.FOLDER_DIALOG)
+        if not r:
+            return None
+        return r[0] if isinstance(r, (list, tuple)) else str(r)
+
+    def ouvrir_annee(self, chemin: str) -> dict[str, Any]:
+        chemin = (chemin or "").strip().strip('"').strip()
+        noter(f"appel ouvrir_annee : {chemin!r}")
+        if not chemin:
+            return {"erreur": "Indique le dossier de l'année."}
+        p = Path(chemin)
+        if not p.is_dir():
+            return {"erreur": f"Dossier introuvable : {chemin}"}
+        if self._chantier and self._chantier.en_cours() and self._chantier.annee.racine != p:
+            return {"erreur": "Un traitement est en cours sur une autre année : arrête-le d'abord."}
+        self._annee = an.Annee(p)
+        ecrire_reglages(annee_chemin=str(p))
+        return self.etat_annee()
+
+    def etat_annee(self) -> dict[str, Any]:
+        if not self._annee:
+            return {"erreur": "Aucune année ouverte."}
+        chantier = self._chantier if (self._chantier and
+                                      self._chantier.annee.racine == self._annee.racine) else None
+        try:
+            return instantane_annee(self._annee, chantier)
+        except Exception as exc:  # noqa: BLE001
+            noter("année : état illisible — " + traceback.format_exc()[-800:])
+            return {"erreur": f"Lecture du dossier impossible : {_lisible(exc)}"}
+
+    def preparer_dossiers_annee(self) -> dict[str, Any]:
+        """Range dans le dossier des audios les enregistrements et l'horaire
+        posés à la racine de l'année, puis crée un dossier par matière."""
+        a = self._annee
+        if not a:
+            return {"erreur": "Aucune année ouverte."}
+        if self._occupe():
+            return {"erreur": "Attends la fin du traitement en cours."}
+        try:
+            ranges = a.ranger()
+            crees = a.creer_structure(a.charger_horaire())
+        except Exception as exc:  # noqa: BLE001
+            noter("année : dossiers — " + traceback.format_exc()[-600:])
+            return {"erreur": f"Préparation des dossiers impossible : {_lisible(exc)}"}
+        noter(f"année : {len(ranges)} fichier(s) rangé(s), dossiers créés : {crees}")
+        etat = self.etat_annee()
+        morceaux = []
+        deplaces = [m for m in ranges if "→" in m]
+        if deplaces:
+            morceaux.append(f"{len(deplaces)} fichier(s) rangé(s) dans « {a.dossier_audios().name} »")
+        if crees:
+            morceaux.append(f"{len(crees)} dossier(s) créé(s) : " + ", ".join(crees))
+        morceaux += [m for m in ranges if "→" not in m]
+        etat["message"] = " · ".join(morceaux) or "Les dossiers étaient déjà prêts."
+        return etat
+
+    def lire_horaire_annee(self, claude: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        return self._lancer_chantier(dict(claude or {}, genre="horaire"))
+
+    def modifier_horaire_annee(self) -> dict[str, Any]:
+        a = self._annee
+        if not a:
+            return {"erreur": "Aucune année ouverte."}
+        if not a.horaire_json().is_file():
+            return {"erreur": "L'horaire n'a pas encore été lu : clique « Lire l'horaire »."}
+        ouvrir_fichier(a.horaire_json(), modifier=True)
+        return {}
+
+    def classer_audio_annee(self, relatif: str, matiere: str) -> dict[str, Any]:
+        a = self._annee
+        if not a:
+            return {"erreur": "Aucune année ouverte."}
+        try:
+            a.classer_manuellement(relatif, matiere)
+        except OSError as exc:
+            return {"erreur": f"Classement non enregistré : {exc}"}
+        return self.etat_annee()
+
+    def lancer_annee(self, options: dict[str, Any]) -> dict[str, Any]:
+        """« Tout traiter », ou une matière (`matieres`) — `reecrire` : ses
+        fiches et ses infos sont refaites de zéro."""
+        return self._lancer_chantier(dict(options, genre="tout"))
+
+    def regler_annee(self, reglages: dict[str, Any]) -> dict[str, Any]:
+        a = self._annee
+        if not a:
+            return {"erreur": "Aucune année ouverte."}
+        try:
+            if "ranger" in reglages:
+                a.regler(ranger=bool(reglages["ranger"]))
+        except OSError as exc:
+            return {"erreur": f"Réglage non enregistré : {exc}"}
+        return self.etat_annee()
+
+    def refaire_word_annee(self, matiere: str = "") -> dict[str, Any]:
+        return self._lancer_chantier({"genre": "word", "matieres": [matiere] if matiere else []})
+
+    def arreter_annee(self) -> dict[str, Any]:
+        if self._chantier and self._chantier.en_cours():
+            noter("année : arrêt demandé")
+            self._chantier.arreter()
+        return {}
+
+    def ouvrir_annee_chemin(self, chemin: str) -> dict[str, Any]:
+        """Ouvre un fichier ou un dossier de l'année (fiches Word, dossier
+        d'une matière…), et rien en dehors."""
+        p = Path(chemin or "")
+        try:
+            racine = self._annee.racine.resolve() if self._annee else None
+            cible = p.resolve()
+            dedans = racine is not None and (cible == racine or racine in cible.parents)
+        except OSError:
+            dedans = False
+        if not dedans:
+            return {"erreur": "Chemin hors du dossier de l'année."}
+        if not p.exists():
+            return {"erreur": f"Introuvable : {p.name}"}
+        ouvrir_fichier(p)
+        return {}
+
+    def ouvrir_consignes_annee(self) -> None:
+        try:
+            installer_modeles_annee()
+        except Exception:  # noqa: BLE001
+            CONSIGNES_ANNEE.mkdir(parents=True, exist_ok=True)
+        ouvrir_fichier(CONSIGNES_ANNEE)
+
+    def _lancer_chantier(self, options: dict[str, Any]) -> dict[str, Any]:
+        a = self._annee
+        noter(f"appel chantier {options.get('genre')} : {options.get('matieres') or 'toutes'}")
+        if not a:
+            return {"erreur": "Aucune année ouverte."}
+        if self._occupe():
+            return {"erreur": "Un traitement est déjà en cours."}
+        try:
+            modele, effort = reglages_claude(options)
+        except ValueError as exc:
+            return {"erreur": str(exc)}
+        options = dict(options, claude_modele=modele, claude_effort=effort)
+        if options.get("genre") == "tout":
+            ecrire_reglages(annee_modele=options.get("modele") or "large-v3",
+                            claude_modele=modele, claude_effort=effort)
+        self._chantier = Chantier(a, options, self._pousser_annee)
+        self._chantier.lancer()
+        return self.etat_annee()
+
+    def _occupe(self) -> bool:
+        return bool((self._chantier and self._chantier.en_cours())
+                    or (self._courant and self._courant.etat == "en_cours"))
+
+    def _pousser_annee(self, instantane: dict[str, Any]) -> None:
+        if not self._fenetre or not self._chantier or instantane.get("id") != self._chantier.id:
+            return
+        charge = json.dumps(instantane, ensure_ascii=False)
+        try:
+            self._fenetre.evaluate_js(f"window.majChantier && window.majChantier({charge})")
+        except Exception:  # noqa: BLE001
+            pass
+
     def lire(self, genre: str) -> str:
         if not self._courant:
             return ""
@@ -1899,10 +3704,12 @@ class Passerelle:
             except Exception as exc:  # noqa: BLE001
                 t.echec("transcription", _lisible(exc))
                 return
+        t.connexion = False
         try:
             markdown = synthetiser(t, transcription)
         except Exception as exc:  # noqa: BLE001
             noter("synthèse : échec — " + str(exc)[:300])
+            t.connexion = isinstance(exc, ConnexionClaude)
             t.echec("synthese", _lisible(exc))
             return
         try:

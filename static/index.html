@@ -82,7 +82,16 @@ input:focus,select:focus,textarea:focus{border-color:var(--ink)}
 .outil[data-etat="maj"]::before{background:var(--hi-yellow);
   box-shadow:0 0 0 2px #E9F660aa;animation:pulse 1.1s ease-in-out infinite}
 .outil[data-etat="ok"]::before{background:#4BAA5E}
-.outil[data-etat="echec"]::before,.outil[data-etat="absent"]::before{background:var(--red)}
+.outil[data-etat="echec"]::before,.outil[data-etat="absent"]::before,
+.outil[data-etat="connexion"]::before{background:var(--red)}
+
+/* Claude Code à connecter au compte Claude */
+.connexion{border-left:3px solid var(--red);background:#FDF4F2;padding:12px 15px;
+  margin-top:12px;font-size:13.5px}
+.connexion[data-etat="retablie"]{border-left-color:#4BAA5E;background:#F3FAF2}
+.connexion p{margin:0}
+.connexion .actions{margin-top:10px}
+.connexion:empty{display:none}
 @keyframes pulse{50%{opacity:.35}}
 
 ol.steps{list-style:none;margin:0;padding:0}
@@ -177,6 +186,7 @@ ul.fichiers .ko{color:var(--red);font-size:12.5px}
 ul.remarques{margin:12px 0 0;padding:10px 14px 10px 30px;background:#FBFCF6;
   border-left:3px solid var(--hi-yellow);font-size:13px}
 ul.remarques:empty{display:none}
+ul.remarques li{overflow-wrap:anywhere}
 ol.steps li[data-cache="1"]{display:none}
 .pleine{grid-column:1/-1}
 .fields .hint.pleine{margin-top:-7px}
@@ -217,17 +227,145 @@ body[data-ecran="suivi"] .eyebrow{margin-bottom:8px}
   .step-detail{grid-column:2;text-align:left}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* ---------- bascule « un cours / une année » ---------- */
+.entete-haut{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 14px}
+.entete-haut .eyebrow{margin:0}
+.modes{display:flex;gap:4px}
+.mode{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;
+  border:1px solid var(--rule);background:transparent;color:var(--ink-2);padding:6px 11px;
+  border-radius:2px;cursor:pointer}
+.mode[aria-selected="true"]{background:var(--ink);border-color:var(--ink);color:#fff}
+.mode:disabled{opacity:.4;cursor:not-allowed}
+body[data-mode="cours"] [data-pour="annee"],body[data-mode="annee"] [data-pour="cours"]{display:none!important}
+body[data-mode="annee"] #panel-choix,body[data-mode="annee"] #panel-etapes,
+body[data-mode="annee"] #panel-resultat{display:none!important}
+body[data-mode="cours"] #annee{display:none}
+
+/* ---------- mode année ---------- */
+.a-grille{display:grid;grid-template-columns:1fr;column-gap:18px}
+@media (min-width:1000px){
+  body[data-mode="annee"] .wrap{max-width:1240px}
+  body[data-mode="annee"] h1{max-width:none}
+  .a-grille{grid-template-columns:minmax(330px,4fr) 7fr;align-items:start}
+}
+.etats{list-style:none;margin:12px 0 0;padding:0;font-size:13.5px}
+.etats:empty{display:none}
+.etats li{display:flex;gap:9px;align-items:baseline;padding:3px 0}
+.etats li::before{content:"";width:7px;height:7px;border-radius:50%;flex:none;background:#B8BFB2;
+  transform:translateY(-1px)}
+.etats li[data-ok="1"]::before{background:#4BAA5E}
+.etats li[data-ok="0"]::before{background:var(--hi-yellow);box-shadow:0 0 0 1px #C9D43F}
+.etats li[data-ok="x"]::before{background:var(--red)}
+.etats code{font-family:var(--mono);font-size:12px}
+.message{font-size:13px;color:var(--ink-2);margin:10px 0 0;-webkit-user-select:text;user-select:text}
+.message:empty{display:none}
+.legende{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+.legende:empty{display:none}
+.ue{font-family:var(--mono);font-size:10.5px;letter-spacing:.05em;padding:3px 8px;border-radius:2px;
+  border:1px solid rgba(0,0,0,.14)}
+.puce{display:inline-block;width:12px;height:12px;border-radius:2px;border:1px solid rgba(0,0,0,.2)}
+
+ul.matieres{list-style:none;margin:0;padding:0}
+ul.matieres li{display:grid;grid-template-columns:12px minmax(0,1fr) auto auto;gap:5px 12px;
+  align-items:center;padding:10px 0;border-top:1px solid var(--rule-2)}
+ul.matieres li:first-child{border-top:none}
+.m-nom{font-weight:600;font-size:14.5px;line-height:1.3}
+.m-sous{font-size:12px;color:var(--ink-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.m-chiffres{font-family:var(--mono);font-size:11.5px;color:var(--ink-2);text-align:right;
+  white-space:nowrap;line-height:1.4}
+.m-actions{grid-column:2/-1;display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+.m-actions .detail{font-family:var(--mono);font-size:11px;color:var(--ink-2);margin-left:4px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+.m-actions .detail[data-e="erreur"]{color:var(--red)}
+.pastille{font-family:var(--mono);font-size:10.5px;letter-spacing:.04em;text-transform:uppercase;
+  padding:2px 8px;border-radius:9px;white-space:nowrap;background:#EEF1E8;color:var(--ink-2)}
+.pastille[data-e="ok"]{background:#DFF3E2;color:#2E7D32}
+.pastille[data-e="faire"]{background:#F4F9C8;color:#5F5E10}
+.pastille[data-e="cours"]{background:#DDF4F6;color:#0B6E78}
+.pastille[data-e="erreur"]{background:#FDE2DE;color:var(--red)}
+.vide{font-size:13.5px;color:var(--ink-2);margin:0}
+ul.matieres li.sans{display:block;padding:12px 0 2px}
+.sans-titre{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--ink-2);margin:0 0 8px}
+.sans-liste{display:flex;flex-wrap:wrap;gap:6px}
+.sans-liste button{font-size:12.5px;border:1px solid var(--rule);background:#fff;border-radius:2px;
+  padding:4px 9px 4px 7px;cursor:pointer;display:flex;align-items:center;gap:6px;color:var(--ink)}
+.sans-liste button:hover{border-color:var(--ink)}
+
+ul.audios{list-style:none;margin:0;padding:0}
+ul.audios li{display:grid;grid-template-columns:92px minmax(0,1fr) 200px 96px;gap:4px 10px;
+  align-items:center;padding:8px 0;border-top:1px solid var(--rule-2);font-size:13px}
+ul.audios li:first-child{border-top:none}
+.a-quand{font-family:var(--mono);font-size:11.5px;line-height:1.35}
+.a-quand small{display:block;color:var(--ink-2);font-size:10.5px}
+li[data-classe="0"] .a-quand{color:var(--red)}
+.a-nom{min-width:0}
+.a-nom .t{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.a-nom small{display:block;font-size:11.5px;color:var(--ink-2);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+ul.audios select{font-size:12.5px;padding:5px 6px;border-left:6px solid var(--rule)}
+.a-etat{font-family:var(--mono);font-size:11px;color:var(--ink-2);text-align:right;line-height:1.3}
+.a-etat[data-e="ok"]{color:#2E7D32}
+.a-etat[data-e="erreur"],.a-etat[data-e="a_classer"]{color:var(--red)}
+.a-etat small{display:block;color:var(--ink-2);font-size:10.5px}
+.a-etat[data-e="nouveau"] b{display:inline-block;font-weight:500;font-size:10px;letter-spacing:.05em;
+  text-transform:uppercase;background:#F4F9C8;color:#5F5E10;border-radius:9px;padding:1px 7px}
+ul.audios li.groupe{display:block;padding:0}
+ul.audios li.groupe details{border-top:1px solid var(--rule-2)}
+ul.audios li.groupe:first-child details{border-top:none}
+ul.audios li.groupe summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;
+  padding:9px 0;font-size:13px;color:var(--ink-2)}
+ul.audios li.groupe summary::-webkit-details-marker{display:none}
+ul.audios li.groupe summary::before{content:"▸";font-size:11px;width:10px;color:var(--ink-2)}
+ul.audios li.groupe details[open] summary::before{content:"▾"}
+ul.audios li.groupe summary b{font-weight:600;color:var(--ink)}
+ul.audios li.groupe summary .ok{color:#2E7D32;font-family:var(--mono);font-size:11px}
+ul.audios li.groupe ul.audios{padding-left:18px;padding-bottom:4px}
+ul.audios li.groupe ul.audios li:first-child{border-top:1px dashed var(--rule-2)}
+ul.audios li.a-sep{display:block;font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--ink-2);padding:14px 0 4px;border-top:1px solid var(--rule-2)}
+ul.audios > li.a-sep:first-child{border-top:none;padding-top:0}
+.case{display:flex;align-items:center;gap:8px;font-size:13px;margin-top:10px;cursor:pointer}
+.case input{width:16px;height:16px;margin:0;accent-color:var(--ink)}
+.m-actions .mini.confirmer{border-color:var(--red);color:var(--red)}
+.barre{height:3px;background:var(--rule-2);border-radius:2px;overflow:hidden;margin-top:4px}
+.barre i{display:block;height:100%;background:var(--ink);width:0;transition:width .4s}
+
+.compteurs{display:flex;gap:14px;flex-wrap:wrap;font-family:var(--mono);font-size:11.5px;
+  color:var(--ink-2);margin:14px 0 0}
+.compteurs:empty{display:none}
+.compteurs b{color:var(--ink);font-weight:600}
+ul.encours{list-style:none;margin:10px 0 0;padding:0}
+ul.encours:empty{display:none}
+ul.encours li{padding:8px 0;border-top:1px solid var(--rule-2);font-size:13px}
+ul.encours .l{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ul.encours .d{display:block;font-family:var(--mono);font-size:11.5px;color:var(--ink-2);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ul.encours li[data-statut="erreur"] .d{color:var(--red);white-space:normal}
+.go.arret{background:var(--red)}
+.fields.serre{grid-template-columns:1fr 1fr;margin-top:6px}
 </style>
 </head>
-<body data-ecran="choix">
+<body data-ecran="choix" data-mode="cours">
 <div class="wrap">
 
   <header>
-    <p class="eyebrow">Transcriptor</p>
-    <h1>De l'auditoire à la <span class="swipe">fiche</span>, sans rien retaper.</h1>
-    <p class="lede">Choisis l'enregistrement du cours, et si tu les as, les diapos ou
+    <div class="entete-haut">
+      <p class="eyebrow">Transcriptor</p>
+      <nav class="modes" role="tablist" aria-label="Mode">
+        <button class="mode" type="button" role="tab" data-mode="cours" aria-selected="true">Un cours</button>
+        <button class="mode" type="button" role="tab" data-mode="annee" aria-selected="false">Une année</button>
+      </nav>
+    </div>
+    <h1 data-pour="cours">De l'auditoire à la <span class="swipe">fiche</span>, sans rien retaper.</h1>
+    <p class="lede" data-pour="cours">Choisis l'enregistrement du cours, et si tu les as, les diapos ou
       les photos du tableau. L'audio est transcrit sur ta carte graphique, puis Claude
       croise le tout et rédige selon le modèle de consignes choisi.</p>
+    <h1 data-pour="annee">Toute l'année, rangée <span class="swipe swipe--pink">par matière</span>.</h1>
+    <p class="lede" data-pour="annee">L'horaire dit quel cours a été enregistré, jour et heure à l'appui.
+      Chaque matière devient un seul cours suivi : fiches résumés en Word, aux couleurs de
+      l'horaire, et une fiche des infos d'examen.</p>
   </header>
 
   <div id="panel-choix">
@@ -308,6 +446,7 @@ body[data-ecran="suivi"] .eyebrow{margin-bottom:8px}
 
     <button class="go" id="go" disabled>Transcrire et résumer</button>
     <p class="outil" id="etat-claude" data-etat="inconnu"></p>
+    <div class="connexion" id="c-connexion"></div>
     <div id="erreur-choix"></div>
   </section>
   </div>
@@ -359,6 +498,91 @@ body[data-ecran="suivi"] .eyebrow{margin-bottom:8px}
     <p class="usage" id="usage"></p>
   </section>
 
+  <div id="annee">
+    <div class="a-grille">
+      <div class="a-col">
+        <section class="panel" id="a-panel-dossier">
+          <p class="panel-title">L'année</p>
+          <div class="ligne">
+            <input id="a-chemin" class="grow" placeholder="Z:\…\Année 1"
+                   autocomplete="off" spellcheck="false">
+            <button class="mini" id="a-parcourir" type="button">Parcourir…</button>
+            <button class="mini" id="a-ouvrir" type="button">Ouvrir</button>
+          </div>
+          <p class="hint" style="margin-top:6px">Le dossier de l'année : un dossier par matière y est
+            créé, et un dossier « 00 - Audios et horaire » pour tous les enregistrements.</p>
+          <ul class="etats" id="a-etats"></ul>
+          <div class="actions" id="a-actions-dossier"></div>
+          <p class="message" id="a-message"></p>
+          <div id="a-erreur"></div>
+        </section>
+
+        <section class="panel" id="a-panel-horaire" hidden>
+          <p class="panel-title">Horaire</p>
+          <ul class="etats" id="a-horaire"></ul>
+          <div class="legende" id="a-legende"></div>
+          <div class="actions">
+            <button class="action" id="a-lire-horaire" type="button">Lire l'horaire</button>
+            <button class="action" id="a-modifier-horaire" type="button"
+                    title="horaire.json : matières, couleurs, créneaux — modifiable">Modifier</button>
+          </div>
+        </section>
+
+        <section class="panel" id="a-panel-traitement" hidden>
+          <p class="panel-title">Traitement</p>
+          <div class="fields serre">
+            <div class="field">
+              <label for="a-modele">Transcription</label>
+              <select id="a-modele">
+                <option value="large-v3">large-v3 — précis</option>
+                <option value="large-v3-turbo">large-v3-turbo — rapide</option>
+                <option value="medium">medium — sans GPU</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="a-claude-effort">Effort de Claude</label>
+              <select id="a-claude-effort"><option value="">Par défaut</option></select>
+            </div>
+            <div class="field wide">
+              <label for="a-claude-modele">Modèle Claude</label>
+              <select id="a-claude-modele"><option value="">Par défaut du compte</option></select>
+              <input id="a-claude-autre" placeholder="Identifiant : claude-opus-5-5, opus[1m]…"
+                     autocomplete="off" spellcheck="false" hidden>
+            </div>
+          </div>
+          <button class="go" id="a-go" type="button" disabled>Tout traiter</button>
+          <p class="hint" style="margin-top:8px">Transcrit les nouveaux enregistrements, rédige les
+            notes de leurs séances, puis les ajoute aux fiches et aux infos de leur matière. Ce qui y
+            est déjà n'est jamais refait.</p>
+          <label class="case" title="Une fois dans les fiches, un enregistrement part dans « Traités\2026-09 » (son mois) ; « pas un cours » et doublons dans « Écartés ». Rien n'est refait pour autant.">
+            <input type="checkbox" id="a-ranger" checked> Ranger les audios traités dans « Traités », par mois</label>
+          <p class="outil" id="a-etat-claude" data-etat="inconnu"></p>
+          <div class="connexion" id="a-connexion"></div>
+          <div class="compteurs" id="a-compteurs"></div>
+          <ul class="encours" id="a-encours"></ul>
+          <ul class="remarques" id="a-remarques"></ul>
+          <div class="actions">
+            <button class="action" id="a-word" type="button"
+                    title="Remettre en page tous les Word avec l'en-tête docx: actuel des consignes, sans relancer Claude">Refaire les Word</button>
+            <button class="action" id="a-consignes" type="button"
+                    title="Les consignes du mode année : horaire, notes de séance, fiches, infos">Consignes</button>
+          </div>
+        </section>
+      </div>
+
+      <div class="a-col">
+        <section class="panel" id="a-panel-matieres" hidden>
+          <p class="panel-title">Matières</p>
+          <ul class="matieres" id="a-matieres"></ul>
+        </section>
+        <section class="panel" id="a-panel-audios" hidden>
+          <p class="panel-title" id="a-titre-audios">Enregistrements</p>
+          <ul class="audios" id="a-audios"></ul>
+        </section>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -374,6 +598,7 @@ window.addEventListener("pywebviewready", async () => {
   suivreClaude();
   chargerOptionsClaude();
   chargerConsignes();
+  initialiserAnnee();
   try {
     const initial = await api.fichier_initial();
     if (initial && initial.chemin) retenir(initial);
@@ -386,21 +611,115 @@ window.addEventListener("pywebviewready", async () => {
 /* Python pousse l'état par window.majClaude ; tant que la page n'était pas
    prête il a pu parler dans le vide, d'où une relance polie jusqu'à ce
    que la vérification soit terminée. */
+let etatClaude = {};
 window.majClaude = function (s) {
-  const p = $("#etat-claude");
-  p.dataset.etat = s.etat || "inconnu";
-  p.textContent = s.texte || "";
+  etatClaude = s || {};
+  for (const p of [$("#etat-claude"), $("#a-etat-claude")]) {
+    if (!p) continue;
+    p.dataset.etat = s.etat || "inconnu";
+    p.textContent = s.texte || "";
+  }
+  // Fenêtre de connexion refermée : Python a relu l'état de connexion
+  // (« verifie » change à chaque relecture).
+  if (connexion === "ouverte" && (s.verifie || "") !== verifieAvant) {
+    connexion = s.connexion === "non" ? "echouee" : "retablie";
+  }
+  rendreConnexion();
 };
 async function suivreClaude() {
-  for (let i = 0; i < 200; i++) {            // 200 × 3 s : au-delà, on laisse
+  // Jusqu'à la fin de la mise à jour, puis un peu au-delà pour l'état de
+  // connexion (claude auth status), qui vient juste après.
+  for (let i = 0, apres = 0; i < 200 && apres < 15; i++) {   // 3 s par tour
     try {
       const s = await api.etat_claude();
       window.majClaude(s);
-      if (s.etat !== "maj" && s.etat !== "inconnu") return;
+      if (s.etat !== "maj" && s.etat !== "inconnu") {
+        if (s.connexion) return;
+        apres++;
+      }
     } catch (_) {}
     await new Promise(r => setTimeout(r, 3000));
   }
 }
+
+/* ---------- connexion de Claude Code au compte Claude ----------
+   « aucune » : rien de demandé ; « ouverte » : la console de connexion est à
+   l'écran ; « retablie » / « echouee » : elle s'est refermée, état relu. */
+let connexion = "aucune";
+let connexionEchec = false;      // le dernier traitement a échoué faute de connexion
+let verifieAvant = "";           // « verifie » au moment d'ouvrir la fenêtre
+function boiteConnexion(relance, cours) {
+  if (connexion === "ouverte") {
+    return `<p>Une fenêtre « Connexion de Claude Code » est ouverte : connecte-toi dans le
+      navigateur qui s'ouvre, puis ferme la fenêtre.</p>`;
+  }
+  if (connexion === "retablie") {
+    return `<p>Claude Code est connecté à ton compte Claude.</p>` + (relance
+      ? `<div class="actions"><button class="action action--fort" type="button"
+           data-relancer="${relance.cle}">${echapper(relance.libelle)}</button></div>` : "");
+  }
+  const texte = connexion === "echouee"
+    ? "La connexion n'a pas abouti. Réessaie : si le navigateur ne s'ouvre pas, copie dans le navigateur l'adresse affichée dans la fenêtre."
+    : "Claude Code n'est pas connecté à ton compte Claude : " + (cours
+        ? "la synthèse ne peut pas être rédigée."
+        : "impossible de lire l'horaire ou de rédiger les fiches.");
+  return `<p>${echapper(texte)}</p><div class="actions">
+    <button class="action action--fort" type="button" data-connecter>Se connecter à Claude</button></div>
+    <p class="hint" style="margin-top:8px">Une fenêtre s'ouvre, puis ton navigateur : connecte-toi
+      avec le compte de ton abonnement et accepte.</p>`;
+}
+function rendreConnexion() {
+  const besoin = etatClaude.connexion === "non" || connexionEchec;
+  const montrer = besoin || connexion === "ouverte" || (connexion === "retablie" && connexionEchec);
+  const c = $("#c-connexion");
+  if (c) {
+    c.dataset.etat = connexion;
+    c.innerHTML = montrer && !idCourant ? boiteConnexion(null, true) : "";
+  }
+  const a = $("#a-connexion");
+  if (a) {
+    const lu = !!(annee && annee.horaire && annee.horaire.lu);
+    const relance = !chantier || chantier.genre === "horaire" || !lu
+      ? {cle: "horaire", libelle: lu ? "Relire l'horaire" : "Lire l'horaire"}
+      : {cle: "tout", libelle: "Tout traiter"};
+    a.dataset.etat = connexion;
+    a.innerHTML = montrer && !(chantier && chantier.etat === "en_cours") ? boiteConnexion(relance) : "";
+    if (montrer && annee) $("#a-panel-traitement").hidden = false;
+  }
+  const e = $("#e-connexion");
+  if (e) {
+    e.dataset.etat = connexion;
+    e.innerHTML = boiteConnexion(connexion === "retablie"
+      ? {cle: "synthese", libelle: "Relancer la synthèse"} : null, true);
+  }
+}
+async function connecterClaude() {
+  verifieAvant = etatClaude.verifie || "";
+  try {
+    const r = await api.connecter_claude();
+    if (r && r.erreur) {
+      for (const id of ["#c-connexion", "#a-connexion", "#e-connexion"]) {
+        const b = $(id);
+        if (b && b.innerHTML) b.insertAdjacentHTML("beforeend", alerte(r.erreur));
+      }
+      return;
+    }
+    connexion = "ouverte";
+  } catch (e) {
+    connexion = "echouee";
+  }
+  rendreConnexion();
+}
+document.addEventListener("click", (ev) => {
+  if (ev.target.closest("[data-connecter]")) { connecterClaude(); return; }
+  const r = ev.target.closest("[data-relancer]");
+  if (!r) return;
+  connexion = "aucune"; connexionEchec = false;
+  rendreConnexion();
+  if (r.dataset.relancer === "horaire") $("#a-lire-horaire").click();
+  else if (r.dataset.relancer === "tout") $("#a-go").click();
+  else if (r.dataset.relancer === "synthese" && $("#relancer")) $("#relancer").click();
+});
 
 /* Rien ne doit échouer en silence : sans destinataire, une erreur du pont
    Python laisse simplement un bouton inerte. */
@@ -484,6 +803,10 @@ async function chargerOptionsClaude() {
   $("#claude-effort").innerHTML = optionsEfforts("");
   choisirModele(claudeOpts.choisi.modele || "");
   $("#claude-effort").value = claudeOpts.choisi.effort || "";
+  $("#a-claude-modele").innerHTML = $("#claude-modele").innerHTML;
+  $("#a-claude-effort").innerHTML = optionsEfforts("");
+  choisirModeleAnnee(claudeOpts.choisi.modele || "");
+  $("#a-claude-effort").value = claudeOpts.choisi.effort || "";
 }
 function optionsModeles(valeur) {
   const liste = claudeOpts.modeles.slice();
@@ -516,7 +839,7 @@ function decrireClaude(c) {
 }
 
 /* ---------- supports du cours ---------- */
-const GENRES = {photo:"photo", diapos:"pptx", pdf:"pdf", notes:"notes", ppt:"ppt"};
+const GENRES = {photo:"photo", diapos:"pptx", pdf:"pdf", notes:"notes", ppt:"ppt", document:"docx"};
 $("#ajouter-supports").addEventListener("click", async () => {
   if (!api) return;
   try {
@@ -651,6 +974,8 @@ function signalerEchec(t) {
   const enPanne = Object.entries(t.etapes).find(([, e]) => e.statut === "erreur");
   const etape = enPanne ? enPanne[0] : "";
   let html = alerte(t.erreur || "Étape interrompue.");
+  connexionEchec = !!t.connexion;
+  if (t.connexion) html += `<div class="connexion" id="e-connexion"></div>`;
   if (etape === "synthese") {
     // Limite atteinte, modèle indisponible : on peut changer de modèle ici.
     const c = t.claude || {};
@@ -666,10 +991,12 @@ function signalerEchec(t) {
   html += `<button class="action" id="ouvrir-dossier-echec">Ouvrir le dossier</button>
            <button class="action" id="recommencer">Un autre cours</button></div>`;
   $("#erreur-etapes").innerHTML = html;
+  rendreConnexion();
 
   const relancer = $("#relancer");
   if (relancer) relancer.addEventListener("click", async () => {
     relancer.disabled = true;
+    connexionEchec = false;
     try {
       const r = await api.relancer_synthese({modele: $("#r-modele").value,
                                              effort: $("#r-effort").value});
@@ -744,6 +1071,474 @@ $("#copier").addEventListener("click", async () => {
   $("#copier").textContent = "Copié";
   setTimeout(() => ($("#copier").textContent = "Copier le Markdown"), 1600);
 });
+
+/* ---------- mode année ---------- */
+/* Un dossier par année : l'horaire classe les enregistrements par matière,
+   chaque matière devient un seul cours suivi (fiches Word + infos d'examen).
+   Python pousse l'avancement par window.majChantier ; les tableaux sont
+   relus (etat_annee) quand une étape change de statut. */
+let annee = null;              // dernier état du dossier renvoyé par Python
+let chantier = null;           // traitement en cours ou dernier terminé
+let relecture = null;
+
+async function initialiserAnnee() {
+  try {
+    const r = await api.annee_initiale();
+    if (r.modele) $("#a-modele").value = r.modele;
+    if (r.chemin) $("#a-chemin").value = r.chemin;
+    basculer(r.mode === "annee" ? "annee" : "cours", false);
+  } catch (e) { /* écran « un cours » par défaut */ }
+}
+
+function basculer(mode, retenir = true) {
+  document.body.dataset.mode = mode;
+  document.querySelectorAll(".mode").forEach(b =>
+    b.setAttribute("aria-selected", String(b.dataset.mode === mode)));
+  document.body.dataset.ecran = mode === "annee" ? "annee"
+    : ($("#panel-choix").hidden ? "suivi" : "choix");
+  if (retenir && api) api.retenir_mode(mode);
+  if (mode === "annee" && !annee && $("#a-chemin").value.trim()) ouvrirAnnee($("#a-chemin").value);
+}
+document.querySelectorAll(".mode").forEach(b => b.addEventListener("click", () => basculer(b.dataset.mode)));
+
+function erreurAnnee(m) { $("#a-erreur").innerHTML = m ? alerte(m) : ""; }
+function enCours() { return !!(chantier && chantier.etat === "en_cours"); }
+function matiereNommee(nom) { return ((annee && annee.matieres) || []).find(m => m.nom === nom); }
+
+$("#a-parcourir").addEventListener("click", async () => {
+  if (!api) return;
+  try {
+    const chemin = await api.choisir_dossier_annee();
+    if (chemin) { $("#a-chemin").value = chemin; ouvrirAnnee(chemin); }
+  } catch (e) { erreurAnnee("Choix du dossier impossible : " + e); }
+});
+$("#a-ouvrir").addEventListener("click", () => ouvrirAnnee($("#a-chemin").value));
+$("#a-ranger").addEventListener("change", async () => {
+  if (!api || !annee) return;
+  try {
+    const r = await api.regler_annee({ranger: $("#a-ranger").checked});
+    if (r.erreur) { erreurAnnee(r.erreur); return; }
+    afficherAnnee(r);
+  } catch (e) { erreurAnnee("Réglage impossible : " + e); }
+});
+$("#a-chemin").addEventListener("keydown", (e) => { if (e.key === "Enter") ouvrirAnnee($("#a-chemin").value); });
+
+async function ouvrirAnnee(chemin) {
+  if (!api) return;
+  erreurAnnee("");
+  $("#a-message").textContent = "Lecture du dossier…";
+  try {
+    const r = await api.ouvrir_annee(chemin);
+    $("#a-message").textContent = "";
+    if (r.erreur) { erreurAnnee(r.erreur); return; }
+    afficherAnnee(r);
+  } catch (e) {
+    $("#a-message").textContent = "";
+    erreurAnnee("Ouverture impossible : " + e);
+  }
+}
+
+async function relireAnnee() {
+  if (!api || !annee) return;
+  try {
+    const r = await api.etat_annee();
+    if (r.erreur) erreurAnnee(r.erreur); else afficherAnnee(r);
+  } catch (e) { /* prochaine relecture */ }
+}
+function relireBientot(delai) {
+  clearTimeout(relecture);
+  relecture = setTimeout(relireAnnee, delai);
+}
+window.addEventListener("focus", () => {
+  // Un PDF ajouté, un horaire modifié dans l'Explorateur : visible au retour.
+  if (document.body.dataset.mode === "annee" && annee && !enCours()) relireBientot(300);
+});
+
+function afficherAnnee(a) {
+  annee = a;
+  if (a.chantier) { chantier = a.chantier; connexionEchec = !!chantier.connexion; }
+  const mats = a.matieres || [];
+  $("#a-ranger").checked = a.ranger !== false;
+
+  // -- le dossier --
+  const etats = [[a.audios.existe ? "1" : "0", a.audios.existe
+    ? `Audios et horaire : « ${a.audios.dossier} »`
+    : `Dossier des audios à créer : « ${a.audios.dossier} »`]];
+  if (a.a_ranger.length)
+    etats.push(["0", `${a.a_ranger.length} fichier${a.a_ranger.length > 1 ? "s" : ""} à ranger depuis la racine ` +
+                     `(enregistrements, horaire)`]);
+  if (mats.length) {
+    const manquants = mats.filter(m => !m.dossier_existe).length;
+    etats.push([manquants ? "0" : "1", manquants
+      ? `${manquants} dossier${manquants > 1 ? "s" : ""} de matière à créer sur ${mats.length}`
+      : `Un dossier par matière (${mats.length})`]);
+  }
+  $("#a-etats").innerHTML = etats.map(([ok, t]) => `<li data-ok="${ok}">${echapper(t)}</li>`).join("");
+  const aPreparer = !a.audios.existe || a.a_ranger.length || mats.some(m => !m.dossier_existe);
+  $("#a-actions-dossier").innerHTML =
+    (aPreparer ? `<button class="action action--fort" id="a-preparer" type="button"
+                   title="Ranger les audios et l'horaire, créer un dossier par matière">Préparer les dossiers</button>` : "")
+    + `<button class="action" id="a-ouvrir-racine" type="button">Ouvrir le dossier</button>`;
+  if (aPreparer) $("#a-preparer").addEventListener("click", preparerDossiers);
+  $("#a-ouvrir-racine").addEventListener("click", () => api.ouvrir_annee_chemin(annee.chemin));
+
+  // -- l'horaire --
+  const h = a.horaire;
+  $("#a-panel-horaire").hidden = false;
+  const lignes = [];
+  if (!h.source)
+    lignes.push(["x", `Aucun horaire trouvé : dépose-le (PDF, image, Excel…) dans « ${a.audios.dossier} ».`]);
+  else
+    lignes.push(["1", `Fichier : ${h.source}`]);
+  if (h.lu)
+    lignes.push([h.perime ? "0" : "1", (h.perime ? "Fichier modifié depuis la lecture : relis-le. " : "Lu : ")
+      + `${mats.length} matière${mats.length > 1 ? "s" : ""}` + (h.periode ? `, ${h.periode}` : "")]);
+  else if (h.source)
+    lignes.push(["0", "Pas encore lu : Claude va en tirer les matières, leurs couleurs et les créneaux."]);
+  if (h.formation) lignes.push(["1", h.formation]);
+  for (const x of h.avertissements || []) lignes.push(["0", x]);
+  $("#a-horaire").innerHTML = lignes.map(([ok, t]) => `<li data-ok="${ok}">${echapper(t)}</li>`).join("");
+  const legende = new Map();
+  for (const m of mats) if (!legende.has(m.ue || m.court)) legende.set(m.ue || m.court, m);
+  const ordre = (x) => [parseInt((x.match(/\d+/) || ["999"])[0], 10), x];
+  $("#a-legende").innerHTML = [...legende].sort((a, b) => {
+    const [na, ta] = ordre(a[0]), [nb, tb] = ordre(b[0]);
+    return na - nb || ta.localeCompare(tb, "fr");
+  }).map(([cle, m]) =>
+    `<span class="ue" style="background:${m.couleur};color:${m.encre}" title="${echapper(
+      mats.filter(x => (x.ue || x.court) === cle).map(x => x.court).join(", "))}">${echapper(cle)}</span>`).join("");
+  $("#a-lire-horaire").textContent = h.lu ? "Relire l'horaire" : "Lire l'horaire";
+  $("#a-lire-horaire").classList.toggle("action--fort", !h.lu || h.perime);
+  $("#a-modifier-horaire").disabled = !h.lu;
+
+  $("#a-panel-traitement").hidden = !(h.lu || chantier);
+  afficherMatieres();
+  afficherAudios();
+  afficherChantier();
+}
+
+async function preparerDossiers() {
+  erreurAnnee("");
+  try {
+    const r = await api.preparer_dossiers_annee();
+    if (r.erreur) { erreurAnnee(r.erreur); return; }
+    afficherAnnee(r);
+    $("#a-message").textContent = r.message || "";
+  } catch (e) { erreurAnnee("Préparation impossible : " + e); }
+}
+
+$("#a-lire-horaire").addEventListener("click", async () => {
+  erreurAnnee("");
+  try {
+    const r = await api.lire_horaire_annee({claude_modele: modeleChoisiAnnee(),
+                                           claude_effort: $("#a-claude-effort").value});
+    if (r.erreur) { erreurAnnee(r.erreur); return; }
+    afficherAnnee(r);
+  } catch (e) { erreurAnnee("Lecture de l'horaire impossible : " + e); }
+});
+$("#a-modifier-horaire").addEventListener("click", async () => {
+  const r = await api.modifier_horaire_annee();
+  if (r && r.erreur) erreurAnnee(r.erreur);
+});
+$("#a-consignes").addEventListener("click", () => api.ouvrir_consignes_annee());
+$("#a-word").addEventListener("click", () => lancer(() => api.refaire_word_annee("")));
+$("#a-go").addEventListener("click", async () => {
+  if (enCours()) {
+    $("#a-go").disabled = true;
+    $("#a-go").textContent = "Arrêt en cours…";
+    await api.arreter_annee();
+    return;
+  }
+  lancer(() => api.lancer_annee(optionsAnnee({})));
+});
+function optionsAnnee(extra) {
+  return Object.assign({modele: $("#a-modele").value, claude_modele: modeleChoisiAnnee(),
+                        claude_effort: $("#a-claude-effort").value}, extra);
+}
+async function lancer(appel) {
+  erreurAnnee("");
+  try {
+    const r = await appel();
+    if (r.erreur) { erreurAnnee(r.erreur); return; }
+    afficherAnnee(r);
+  } catch (e) { erreurAnnee("Lancement impossible : " + e); }
+}
+
+function choisirModeleAnnee(valeur) {
+  const connu = claudeOpts.modeles.some(m => m.valeur === valeur);
+  $("#a-claude-modele").value = connu ? valeur : AUTRE;
+  $("#a-claude-autre").hidden = connu;
+  if (!connu) $("#a-claude-autre").value = valeur;
+}
+function modeleChoisiAnnee() {
+  return $("#a-claude-modele").value === AUTRE ? $("#a-claude-autre").value.trim()
+                                               : $("#a-claude-modele").value;
+}
+$("#a-claude-modele").addEventListener("change", () => {
+  const autre = $("#a-claude-modele").value === AUTRE;
+  $("#a-claude-autre").hidden = !autre;
+  if (autre) $("#a-claude-autre").focus();
+});
+
+// -- matières --
+function tachesDe(nom) { return chantier ? chantier.taches.filter(t => t.matiere === nom) : []; }
+function afficherMatieres() {
+  const mats = (annee && annee.matieres) || [];
+  $("#a-panel-matieres").hidden = !mats.length;
+  // Une matière sans enregistrement, sans support ni fiche n'a rien à montrer :
+  // elle rejoint la ligne compacte du bas (un clic ouvre son dossier).
+  const vide = (m) => !m.seances && !m.supports && !m.fiches && !m.infos && !tachesDe(m.nom).length;
+  const pleines = mats.map((m, i) => [m, i]).filter(([m]) => !vide(m));
+  const vides = mats.map((m, i) => [m, i]).filter(([m]) => vide(m));
+  $("#a-matieres").innerHTML = pleines.map(([m, i]) => {
+    const t = tachesDe(m.nom);
+    const active = t.find(x => x.statut === "en_cours");
+    const erreur = t.find(x => x.statut === "erreur");
+    let etat = "", texte = "aucun audio", detail = "";
+    if (active) {
+      etat = "cours"; texte = "en cours";
+      detail = `${active.libelle.split(" · ")[0]} · ${active.detail || ""}`;
+    } else if (erreur) {
+      etat = "erreur"; texte = "erreur"; detail = erreur.detail || "";
+    } else if (m.a_jour) {
+      etat = "ok"; texte = "à jour";
+      detail = [m.dans_fiches ? `${pluriel(m.dans_fiches, "séance")} dans les fiches` : "",
+                m.fiches ? `Word du ${m.fiches.date}` : ""].filter(Boolean).join(" · ");
+    } else if (m.seances) {
+      etat = "faire"; texte = "à faire";
+      const reste = m.audios - m.transcrits;
+      detail = reste ? `${pluriel(reste, "audio")} à transcrire` : !m.fiches ? "fiches à rédiger"
+        : [m.nouvelles ? `${pluriel(m.nouvelles, "nouvelle séance", "nouvelles séances")}` : "",
+           m.docs_nouveaux ? `${pluriel(m.docs_nouveaux, "nouveau document", "nouveaux documents")}` : ""]
+            .filter(Boolean).join(" et ") + " à ajouter";
+    } else if (m.supports && m.fiches) {
+      etat = "faire"; texte = "à faire";
+      detail = `${pluriel(m.docs_nouveaux || 1, "nouveau document", "nouveaux documents")} à ajouter`;
+    } else if (m.supports) {
+      texte = "supports seuls"; detail = "sans audio · « Rédiger » part des supports";
+    }
+    const sous = [m.ue, m.enseignant, m.dossier !== m.court ? `dossier « ${m.dossier} »` : ""]
+      .filter(Boolean).join(" · ");
+    const peutRefaire = (m.seances || m.supports) && !enCours();
+    const aConfirmer = confirmation && confirmation.nom === m.nom && Date.now() < confirmation.jusqua;
+    const titreReecrire = "Relit toutes les séances et refait les fiches et les infos de zéro (par lots). "
+      + "Plus long : utile quand le plan s'est déformé à force d'ajouts, par exemple avant les examens."
+      + (m.ajouts ? ` ${pluriel(m.ajouts, "ajout")} depuis la dernière rédaction complète`
+                    + (m.complet ? ` (${m.complet.split("-").reverse().join("/")})` : "") + "." : "");
+    return `<li>
+      <span class="puce" style="background:${m.couleur}"></span>
+      <div style="min-width:0"><div class="m-nom" title="${echapper(m.nom)}">${echapper(m.court)}</div>
+        <div class="m-sous" title="${echapper(m.nom)}">${echapper(sous)}</div></div>
+      <div class="m-chiffres" title="séances enregistrées / prévues à l'horaire · séances déjà dans les fiches · documents du dossier">
+        ${m.seances}${m.prevues ? " / " + m.prevues : ""} séance${Math.max(m.seances, m.prevues) > 1 ? "s" : ""}${
+        m.fiches && m.seances ? ` · ${m.dans_fiches} ✓` : ""}<br>
+        ${m.supports} support${m.supports > 1 ? "s" : ""}</div>
+      <span class="pastille" data-e="${etat}">${texte}</span>
+      <div class="m-actions">
+        <button class="mini" data-i="${i}" data-act="fiches" type="button" ${m.fiches ? "" : "disabled"}>Fiches</button>
+        <button class="mini" data-i="${i}" data-act="infos" type="button" ${m.infos ? "" : "disabled"}>Infos</button>
+        <button class="mini" data-i="${i}" data-act="dossier" type="button" ${m.dossier_existe ? "" : "disabled"}>Dossier</button>
+        ${m.fiches || m.infos
+          ? `<button class="mini${aConfirmer ? " confirmer" : ""}" data-i="${i}" data-act="reecrire" type="button"
+               ${peutRefaire ? "" : "disabled"} title="${echapper(titreReecrire)}">${aConfirmer
+               ? "Confirmer la réécriture ?" : "Tout réécrire"}</button>`
+          : `<button class="mini" data-i="${i}" data-act="rediger" type="button" ${peutRefaire ? "" : "disabled"}
+               title="Rédiger les fiches et les infos de cette matière">Rédiger</button>`}
+        <span class="detail" data-e="${etat}" title="${echapper(detail)}">${echapper(detail)}</span>
+      </div></li>`;
+  }).join("") + (vides.length ? `<li class="sans"><p class="sans-titre">Pas encore d'enregistrement ni de
+      support · ${vides.length}</p><div class="sans-liste">${vides.map(([m, i]) =>
+      `<button type="button" data-i="${i}" data-act="dossier" title="${echapper(m.nom)} — ouvrir son dossier">
+        <span class="puce" style="background:${m.couleur}"></span>${echapper(m.court)}</button>`).join("")}</div></li>` : "");
+  document.querySelectorAll("#a-matieres button").forEach(b => b.addEventListener("click", () => {
+    const m = mats[+b.dataset.i];
+    if (b.dataset.act === "fiches" && m.fiches) api.ouvrir_annee_chemin(m.fiches.chemin);
+    if (b.dataset.act === "infos" && m.infos) api.ouvrir_annee_chemin(m.infos.chemin);
+    if (b.dataset.act === "dossier") api.ouvrir_annee_chemin(m.chemin);
+    if (b.dataset.act === "rediger") lancer(() => api.lancer_annee(optionsAnnee({matieres: [m.nom]})));
+    if (b.dataset.act === "reecrire") {
+      // Deux clics : la réécriture relit tout et prend du temps.
+      if (confirmation && confirmation.nom === m.nom && Date.now() < confirmation.jusqua) {
+        confirmation = null;
+        lancer(() => api.lancer_annee(optionsAnnee({matieres: [m.nom], reecrire: true})));
+      } else {
+        confirmation = {nom: m.nom, jusqua: Date.now() + 5000};
+        afficherMatieres();
+        setTimeout(() => { if (confirmation && Date.now() >= confirmation.jusqua) {
+          confirmation = null; afficherMatieres(); } }, 5100);
+      }
+    }
+  }));
+}
+let confirmation = null;          // « Tout réécrire » cliqué une fois : {nom, jusqua}
+function pluriel(n, un, plusieurs) {
+  return `${n} ${n > 1 ? (plusieurs || un + "s") : un}`;
+}
+
+// -- enregistrements --
+function etatAudio(e) {
+  const t = chantier ? chantier.taches.find(x => x.cle === "t:" + e.relatif) : null;
+  if (t && t.statut === "en_cours") {
+    const pct = Math.round((t.avancement || 0) * 100);
+    return {e: "", html: `${pct} %<div class="barre"><i style="width:${pct}%"></i></div>`};
+  }
+  if (t && t.statut === "erreur") return {e: "erreur", html: "erreur"};
+  switch (e.etape) {
+    case "fiches": return {e: "ok", html: `✓ fiches<small>${echapper(e.integre.slice(0, 5))}</small>`};
+    case "notes": return {e: "", html: "notes faites"};
+    case "transcrit": return {e: "", html: "transcrit"};
+    case "nouveau": return {e: "nouveau", html: "<b>nouveau</b>"};
+    case "a_classer": return {e: "a_classer", html: "à classer"};
+    case "doublon": return {e: "", html: "doublon"};
+    case "ecarte": return {e: "", html: "écarté"};
+  }
+  return {e: "", html: ""};
+}
+const groupesOuverts = new Set();     // groupes « dans les fiches » dépliés
+function afficherAudios() {
+  const liste = (annee && annee.enregistrements) || [];
+  $("#a-panel-audios").hidden = !annee || (!liste.length && !annee.audios.existe);
+  const aClasser = liste.filter(e => e.etape === "a_classer").length;
+  const enAttente = liste.filter(e => ["nouveau", "transcrit", "notes"].includes(e.etape)).length;
+  $("#a-titre-audios").textContent = `Enregistrements · ${liste.length}`
+    + (enAttente ? ` · ${enAttente} nouveau${enAttente > 1 ? "x" : ""}` : "")
+    + (aClasser ? ` · ${aClasser} à classer` : "");
+  const actif = document.activeElement;
+  if (actif && actif.tagName === "SELECT" && actif.closest("#a-audios")) return;   // choix en cours
+  if (!liste.length) {
+    $("#a-audios").innerHTML = `<li><p class="vide">Aucun enregistrement dans « ${
+      echapper(annee ? annee.audios.dossier : "")} » pour l'instant.</p></li>`;
+    return;
+  }
+  const mats = annee.matieres || [];
+  const ligne = (e) => {
+    const m = matiereNommee(e.matiere);
+    const auto = e.matiere && e.confiance !== "manuel";
+    const options = [`<option value="">${auto ? "Auto : " + echapper(m ? m.court : e.matiere) : "— à classer —"}</option>`]
+      .concat(mats.map(x => `<option value="${echapper(x.nom)}"${e.confiance === "manuel" && x.nom === e.matiere
+        ? " selected" : ""}>${echapper(x.court)}</option>`))
+      .concat([`<option value="__ignore__"${e.ignore ? " selected" : ""}>Pas un cours (écarter)</option>`]).join("");
+    const quand = e.date
+      ? `${echapper(e.jour.slice(0, 3))} ${echapper(e.date.slice(0, 5))}<small>${echapper(e.heure || "heure ?")}${
+         e.duree ? " · " + echapper(e.duree) : ""}</small>`
+      : `date ?<small>${echapper(e.duree || "")}</small>`;
+    const sous = [e.confiance === "sûr" ? "" : (e.confiance ? `${e.confiance} : ` : "") + e.raison,
+                  e.source && !e.source.startsWith("nom du fichier") ? "date : " + e.source : ""]
+      .filter(Boolean).join(" · ");
+    const et = etatAudio(e);
+    const bord = m ? m.couleur : (e.ignore ? "#D5DACE" : "var(--red)");
+    const ou = e.range ? `${e.range.replace(/\//g, "\\")}\\${e.nom}` : e.nom;
+    const choix = e.doublon
+      ? `<select disabled title="Même contenu que « ${echapper(e.doublon)} » : ni transcrit ni rédigé">
+           <option>Doublon</option></select>`
+      : `<select style="border-left-color:${bord}" ${enCours() ? "disabled" : ""}
+              title="Matière de cet enregistrement">${options}</select>`;
+    return `<li data-classe="${e.matiere || e.ignore ? 1 : 0}" data-rel="${echapper(e.relatif)}">
+      <span class="a-quand">${quand}</span>
+      <div class="a-nom"><span class="t" title="${echapper(ou)}">${echapper(e.titre || e.nom)}</span>
+        <small title="${echapper(sous)}">${echapper(sous || e.raison)}</small></div>
+      ${choix}
+      <span class="a-etat" data-e="${et.e}">${et.html}</span></li>`;
+  };
+  const groupe = (cle, titre, elements, droite) =>
+    `<li class="groupe"><details data-g="${echapper(cle)}"${groupesOuverts.has(cle) ? " open" : ""}>
+      <summary><b>${echapper(titre)}</b> · ${pluriel(elements.length, "enregistrement")}
+        ${droite ? `<span class="ok">${droite}</span>` : ""}</summary>
+      <ul class="audios">${elements.map(ligne).join("")}</ul></details></li>`;
+  // En haut, ce qui reste à faire ; puis, repliés, ceux déjà dans les fiches
+  // (par mois, le plus récent d'abord), et enfin les écartés.
+  const aFaire = liste.filter(e => !["fiches", "ecarte", "doublon"].includes(e.etape));
+  const faits = liste.filter(e => e.etape === "fiches");
+  const ecartes = liste.filter(e => e.etape === "ecarte" || e.etape === "doublon");
+  const mois = [...new Set(faits.map(e => e.mois))].sort().reverse();
+  let html = aFaire.map(ligne).join("");
+  if (faits.length) {
+    if (aFaire.length) html += `<li class="a-sep">Déjà dans les fiches</li>`;
+    html += mois.map(g => {
+      const du = faits.filter(e => e.mois === g);
+      return groupe("m" + g, du[0].mois_libelle || "Sans date", du, "✓ dans les fiches");
+    }).join("");
+  }
+  if (ecartes.length) html += groupe("ecartes", "Écartés et doublons", ecartes, "");
+  $("#a-audios").innerHTML = html;
+  document.querySelectorAll("#a-audios details").forEach(d => d.addEventListener("toggle", () => {
+    if (d.open) groupesOuverts.add(d.dataset.g); else groupesOuverts.delete(d.dataset.g);
+  }));
+  document.querySelectorAll("#a-audios select").forEach(sel => sel.addEventListener("change", async () => {
+    const rel = sel.closest("li").dataset.rel;
+    sel.blur();
+    try {
+      const r = await api.classer_audio_annee(rel, sel.value);
+      if (r.erreur) { erreurAnnee(r.erreur); return; }
+      afficherAnnee(r);
+    } catch (e) { erreurAnnee("Classement impossible : " + e); }
+  }));
+}
+function progressionAudios() {
+  // Avancement seul : les listes déroulantes ne sont pas redessinées.
+  document.querySelectorAll("#a-audios li[data-rel]").forEach(li => {
+    const e = (annee.enregistrements || []).find(x => x.relatif === li.dataset.rel);
+    if (!e) return;
+    const et = etatAudio(e), cel = li.querySelector(".a-etat");
+    cel.dataset.e = et.e;
+    cel.innerHTML = et.html;
+  });
+}
+
+// -- traitement --
+const GENRES_TACHES = [["horaire", "Horaire"], ["transcription", "Transcriptions"], ["notes", "Notes"],
+                       ["fiches", "Fiches"], ["infos", "Infos"], ["word", "Word"]];
+function duree(s) {
+  s = Math.max(0, Math.round(s || 0));
+  return s >= 3600 ? `${Math.floor(s / 3600)} h ${String(Math.floor(s % 3600 / 60)).padStart(2, "0")}`
+                   : `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, "0")} s`;
+}
+function afficherChantier() {
+  const c = chantier;
+  const b = $("#a-go");
+  if (enCours()) {
+    b.textContent = "Arrêter"; b.classList.add("arret"); b.disabled = false;
+  } else {
+    b.textContent = "Tout traiter"; b.classList.remove("arret");
+    b.disabled = !(annee && annee.horaire && annee.horaire.lu);
+  }
+  $("#a-word").disabled = enCours();
+  $("#a-lire-horaire").disabled = enCours() || !(annee && annee.horaire.source);
+  if (!c) {
+    $("#a-compteurs").innerHTML = "";
+    $("#a-encours").innerHTML = "";
+    $("#a-remarques").innerHTML = ((annee && annee.remarques) || []).map(r => `<li>${echapper(r)}</li>`).join("");
+    return;
+  }
+  const bilan = GENRES_TACHES.map(([g, l]) => {
+    const t = c.taches.filter(x => x.genre === g);
+    return t.length ? `<span>${l} <b>${t.filter(x => x.statut === "fait").length}/${t.length}</b></span>` : "";
+  }).join("");
+  const fin = {fini: "Terminé", arrete: "Arrêté", erreur: "Échec"}[c.etat];
+  $("#a-compteurs").innerHTML = bilan + `<span>${fin ? fin + " · " : ""}${duree(c.duree)}</span>`;
+  $("#a-encours").innerHTML = c.taches.filter(t => t.statut === "en_cours" || t.statut === "erreur").map(t => {
+    const m = matiereNommee(t.matiere);
+    const pct = ((t.avancement || 0) * 100).toFixed(1);
+    return `<li data-statut="${t.statut}"><span class="l" title="${echapper(t.libelle)}">${
+      echapper((m ? m.court + " · " : "") + t.libelle)}</span><span class="d">${echapper(t.detail || "")}</span>${
+      t.statut === "en_cours" ? `<div class="barre"><i style="width:${pct}%"></i></div>` : ""}</li>`;
+  }).join("");
+  $("#a-remarques").innerHTML = [...(c.remarques || []), ...(c.erreur ? [c.erreur] : [])]
+    .map(r => `<li>${echapper(r)}</li>`).join("");
+  rendreConnexion();
+}
+window.majChantier = function (c) {
+  if (!annee) return;
+  const avant = chantier;
+  chantier = c;
+  connexionEchec = !!c.connexion;
+  $("#a-panel-traitement").hidden = false;
+  afficherChantier();
+  afficherMatieres();
+  const statuts = x => x ? x.etat + "|" + x.taches.map(t => t.statut).join(",") : "";
+  if (statuts(avant) !== statuts(c)) relireBientot(c.etat === "en_cours" ? 2500 : 150);
+  else progressionAudios();
+};
 
 /* ---------- utilitaires ---------- */
 function echapper(s) {

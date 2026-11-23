@@ -47,6 +47,34 @@ REGLAGES_PDF: dict[str, Any] = {
     "css": "",                                # CSS libre, appliqué en dernier
 }
 
+# Réglages du document Word (mode année) reconnus sous `docx:`.
+REGLAGES_DOCX: dict[str, Any] = {
+    "couleurs": "niveaux",            # niveaux : rose, bleu, violet, vert par niveau de titre
+                                      # categories : une couleur par catégorie (##)
+    "palette": ["rose", "bleu", "violet", "vert", "orange", "turquoise"],
+    "surtitre": "Fiches résumés",     # petite ligne au-dessus du nom de la matière
+    "nouvelle_page": True,            # chaque catégorie (##) commence une page
+    "sommaire": True,
+    "schemas": True,                  # blocs ```mermaid rendus en images
+    "police": "Calibri",
+    "taille_texte": 11.0,             # pt
+    "marges": "2cm",
+    "format": "A4",
+    "orientation": "portrait",
+}
+
+# Couleurs reconnues dans `palette` : (texte et filets, fond clair).
+PALETTE_DOCX: dict[str, tuple[str, str]] = {
+    "rose": ("#C2185B", "#FCE4EC"), "bleu": ("#1565C0", "#E3F2FD"),
+    "violet": ("#6A1B9A", "#F3E5F5"), "vert": ("#2E7D32", "#E8F5E9"),
+    "orange": ("#E65100", "#FFF3E0"), "turquoise": ("#00838F", "#E0F7FA"),
+    "rouge": ("#C62828", "#FFEBEE"), "jaune": ("#9A7D0A", "#FFFDE7"),
+    "gris": ("#455A64", "#ECEFF1"), "marron": ("#6D4C41", "#EFEBE9"),
+    "indigo": ("#283593", "#E8EAF6"), "cyan": ("#00838F", "#E0F7FA"),
+    "magenta": ("#AD1457", "#FCE4EC"), "bordeaux": ("#880E4F", "#F8E1EA"),
+    "kaki": ("#5D6B1F", "#F1F4E0"), "corail": ("#D84315", "#FBE9E7"),
+}
+
 # Autres orthographes acceptées pour les clés.
 _ALIAS = {
     "sous-titre": "sous_titre", "soustitre": "sous_titre",
@@ -56,6 +84,8 @@ _ALIAS = {
     "carte": "cartes", "fiches": "cartes",
     "reponse": "reponses", "taille": "taille_texte", "marge": "marges",
     "couleur_principale": "couleur", "corrige": "titre_corrige",
+    "code_couleur": "couleurs", "mode_couleurs": "couleurs", "couleurs_titres": "couleurs",
+    "diagrammes": "schemas", "schema": "schemas", "couleurs_palette": "palette",
 }
 
 _FORMATS = {"a3": "A3", "a4": "A4", "a5": "A5", "letter": "Letter", "legal": "Legal"}
@@ -95,6 +125,7 @@ class Consignes:
     pdf: dict
     avertissements: list[str] = field(default_factory=list)
     claude: dict = field(default_factory=dict)      # {"modele": …, "effort": …}
+    docx: dict = field(default_factory=dict)        # réglages du document Word
 
     @property
     def description(self) -> str:
@@ -110,7 +141,9 @@ def depuis_texte(texte: str, chemin: Optional[Path] = None) -> Consignes:
     meta, corps, avert = separer(texte)
     pdf, avert_pdf = reglages_pdf(meta)
     claude, avert_claude = reglages_claude(meta)
-    return Consignes(chemin, meta, corps, pdf, avert + avert_pdf + avert_claude, claude)
+    docx, avert_docx = reglages_docx(meta)
+    return Consignes(chemin, meta, corps, pdf, avert + avert_pdf + avert_claude + avert_docx,
+                     claude, docx)
 
 
 def modele_valide(v: Any) -> str:
@@ -170,7 +203,7 @@ def separer(texte: str) -> tuple[dict, str, list[str]]:
     m = _RE_ENTETE.match(texte)
     if not m:
         return {}, texte, []
-    voulu = re.search(r"^\s*(pdf|description)\s*:", m.group(1), re.M) is not None
+    voulu = re.search(r"^\s*(pdf|docx|description)\s*:", m.group(1), re.M) is not None
     try:
         meta = _yaml(m.group(1))
     except Exception as exc:  # noqa: BLE001
@@ -335,6 +368,92 @@ def reglages_pdf(meta: dict) -> tuple[dict, list[str]]:
         except ValueError as exc:
             avert.append(f"pdf.{k} : {exc} — valeur par défaut gardée")
     return r, avert
+
+
+def couleur_palette(v: Any) -> tuple[str, str]:
+    """(couleur de texte, fond clair) pour un nom de la palette ou un code
+    hexadécimal ; ValueError sinon."""
+    s = sans_accent(_texte(v)).strip().strip("\"'")
+    if s in PALETTE_DOCX:
+        return PALETTE_DOCX[s]
+    m = re.fullmatch(r"#?([0-9a-f]{6}|[0-9a-f]{3})", s)
+    if not m:
+        raise ValueError(f"couleur inconnue : {_texte(v)[:20]}")
+    h = m.group(1)
+    if len(h) == 3:
+        h = "".join(x * 2 for x in h)
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+    def lum(c: int) -> float:
+        x = c / 255
+        return x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4
+    fort = (r, g, b)
+    for _ in range(24):                      # assombrie jusqu'à être lisible sur blanc
+        if 0.2126 * lum(fort[0]) + 0.7152 * lum(fort[1]) + 0.0722 * lum(fort[2]) <= 0.14:
+            break
+        fort = tuple(round(c * 0.88) for c in fort)
+    clair = tuple(round(255 - (255 - c) * 0.14) for c in (r, g, b))
+    return "#{:02X}{:02X}{:02X}".format(*fort), "#{:02X}{:02X}{:02X}".format(*clair)
+
+
+def reglages_docx(meta: dict) -> tuple[dict, list[str]]:
+    r = {k: (list(v) if isinstance(v, list) else v) for k, v in REGLAGES_DOCX.items()}
+    brut = meta.get("docx") if isinstance(meta, dict) else None
+    if brut is None:
+        return r, []
+    if not isinstance(brut, dict):
+        return r, ["« docx: » doit être suivi de réglages indentés, un par ligne"]
+    avert: list[str] = []
+    for k, v in brut.items():
+        cle = _cle(k)
+        if cle not in REGLAGES_DOCX:
+            avert.append(f"réglage docx inconnu ignoré : {k}")
+            continue
+        try:
+            r[cle] = _normaliser_docx(cle, v)
+        except ValueError as exc:
+            avert.append(f"docx.{k} : {exc} — valeur par défaut gardée")
+    return r, avert
+
+
+def _normaliser_docx(cle: str, v: Any) -> Any:
+    if cle == "couleurs":
+        s = sans_accent(_texte(v)).strip()
+        if s.startswith("cat"):
+            return "categories"
+        if s.startswith(("niv", "hier", "titre")):
+            return "niveaux"
+        raise ValueError("attendu : niveaux ou categories")
+    if cle == "palette":
+        morceaux = v if isinstance(v, list) else re.split(r"[,;]", _texte(v))
+        noms = [str(x).strip() for x in morceaux if str(x).strip()]
+        if not noms:
+            raise ValueError("palette vide")
+        for n in noms:
+            couleur_palette(n)                # lève ValueError si inconnue
+        return noms
+    if cle in ("nouvelle_page", "sommaire", "schemas"):
+        return vrai(v)
+    if cle == "taille_texte":
+        m = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*(pt)?", _texte(v).strip())
+        if not m or not 7 <= float(m.group(1).replace(",", ".")) <= 18:
+            raise ValueError("attendu : une taille entre 7 et 18 (pt)")
+        return float(m.group(1).replace(",", "."))
+    if cle == "marges":
+        parts = str(v).replace(",", " ").split()
+        if not 1 <= len(parts) <= 4:
+            raise ValueError("attendu : 1 à 4 valeurs, comme 2cm ou 18mm 20mm")
+        norm = []
+        for p in parts:
+            if re.fullmatch(r"\d+(\.\d+)?", p):
+                p += "mm"
+            if not re.fullmatch(r"\d+(\.\d+)?(mm|cm|in|pt)", p):
+                raise ValueError(f"marge incomprise : {p}")
+            norm.append(p)
+        return " ".join(norm)
+    if cle in ("format", "orientation", "police"):
+        return _normaliser(cle, v)
+    return _texte(v)                          # surtitre
 
 
 def _normaliser(cle: str, v: Any) -> Any:
