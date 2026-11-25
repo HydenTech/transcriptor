@@ -76,6 +76,17 @@ if "connexion" in os.environ.get("FAUX_CLAUDE_MODE", ""):
                        "Please obtain a new token or refresh your existing token."})
     sys.exit(1)
 
+# Ce qu'a fait le vrai Claude sur la fiche « Infos » d'une matière chargée
+# d'articles : il les ouvre un à un pour en lire le titre, jusqu'à épuiser
+# ses tours (--max-turns) sans avoir rien rédigé.
+if "@@OUVRE_TOUT@@" in entree and "<infos>" in entree and "aucun fichier" not in prompt:
+    for chemin in sorted(Path("supports").glob("*"))[:3]:
+        emettre({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Read", "input": {"file_path": str(chemin.resolve())}}]}})
+    emettre({"type": "result", "subtype": "error_max_turns", "is_error": True, "num_turns": 7,
+             "errors": ["Reached maximum number of turns (6)"]})
+    sys.exit(1)
+
 if "JSON demandé" in prompt:
     texte = Path(os.environ["FAUX_HORAIRE"]).read_text(encoding="utf-8")
 elif "fiches existantes" in prompt:

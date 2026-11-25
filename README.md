@@ -409,6 +409,24 @@ est dans `synthese.log`, dans le dossier du cours ; si Claude avait déjà rédi
 une partie, elle est dans `synthese_partielle.md`. Clique **Relancer la
 synthèse** : rien n'est à retranscrire.
 
+**« Claude a utilisé ses N tours sans finir »** — Claude Code a un nombre
+d'échanges limité par appel (`--max-turns`) ; chaque fichier qu'il ouvre en
+consomme un. En mode année, ce nombre suit le nombre de documents de la
+matière ; le début des documents qui n'ont plus de place (titre, auteurs) est
+donné tel quel, pour qu'il puisse les citer sans les ouvrir. Si la fiche
+« Infos importantes » manque encore de tours, elle est refaite aussitôt d'après
+le texte reproduit, sans rien ouvrir (signalé dans le bilan). Le message dit
+combien de fichiers il a ouverts ; le détail est dans `claude.log`.
+
+**« Chemin trop long pour Windows »** — sans les « chemins longs » activés,
+Windows refuse un chemin de plus de 259 caractères (dossier compris) et
+répond « No such file or directory ». Les titres Plaud y arrivent vite. Les
+fichiers que l'app crée restent en deçà : une transcription au nom trop long
+reçoit un nom raccourci (marqué `~` et 6 caractères), et un audio n'est pas
+rangé dans `Traités` si son chemin y deviendrait trop long. Si c'est l'audio
+lui-même qui dépasse, raccourcis son nom. Un fichier absent n'est plus
+présenté comme « à convertir en MP3 » : les `.ogg` sont lus comme les autres.
+
 **La synthèse est interrompue « aucune sortie depuis 20 min »** — Claude n'a
 plus rien envoyé pendant 20 minutes (réseau, service surchargé). Relance-la.
 Le plafond absolu est de deux heures.

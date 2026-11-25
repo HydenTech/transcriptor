@@ -9,6 +9,7 @@ limite d'utilisation de Claude.
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import sys
@@ -481,6 +482,163 @@ def test_supports_de_cours():
         assert {x["court"]: x for x in p.etat_annee()["matieres"]}["Psychologie"]["a_jour"]
 
 
+def test_infos_tours_epuises():
+    """Cas vu sur une vraie matière : six articles dans le dossier, dont le
+    texte dépasse ce que reçoit la fiche « Infos ». Claude les ouvrait un à un
+    pour en lire le titre et épuisait ses 6 tours sans rien rédiger. Il a
+    maintenant des tours selon le nombre de documents, le début des articles
+    sans place est reproduit, et s'il manque encore de tours, la fiche est
+    refaite d'après le texte reproduit, sans rien ouvrir."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        tr = _environnement(tmp)
+        racine = _annee(tmp)
+        groupe = racine / "Psycho" / "Travail de groupe"
+        groupe.mkdir()
+        corps = "Le vieillissement cognitif normal touche surtout la vitesse de traitement. " * 600
+        for i in (1, 2, 3):
+            (groupe / f"Article {i}.txt").write_text(
+                f"Article {i} : Trajectoires du vieillissement cognitif\nAuteur {i}, Université de Liège\n"
+                + ("@@OUVRE_TOUT@@ " if i == 1 else "") + corps, encoding="utf-8")
+        p = tr.Passerelle()
+        p.ouvrir_annee(str(racine))
+        p.lire_horaire_annee({})
+        attendre(p._chantier)
+        p.preparer_dossiers_annee()
+        p.lancer_annee({"modele": "large-v3"})
+        attendre(p._chantier, 300)
+        taches = {x["cle"]: x for x in p._chantier.instantane()["taches"]}
+        assert taches["i:Psychologie"]["statut"] == "fait", taches["i:Psychologie"]
+        assert any("Psychologie : infos rédigées d'après le texte des documents" in r
+                   for r in p._chantier.remarques), p._chantier.remarques
+        assert (racine / "Psycho" / "Psychologie - Infos importantes.docx").is_file()
+
+        # Premier essai : Read permis, tours selon les 4 documents remis ;
+        # reprise : 6 tours, aucun outil, consigne de ne rien ouvrir.
+        appels = [json.loads(l)["args"] for l in
+                  (tmp / "env" / "appels_claude.jsonl").read_text("utf-8").splitlines()]
+        infos = [a for a in appels if "infos, les informations pratiques" in a[a.index("-p") + 1]]
+        premier = [a for a in infos if "--allowedTools" in a]
+        reprise = [a for a in infos if "N'ouvre aucun fichier" in a[a.index("-p") + 1]]
+        assert len(premier) == 1 and len(reprise) == 1, infos
+        premier, reprise = premier[0], reprise[0]
+        assert premier[premier.index("--max-turns") + 1] == "16"
+        assert premier[premier.index("--allowedTools") + 1] == "Read"
+        assert "N'ouvre un document avec Read que pour" in premier[premier.index("-p") + 1]
+        assert reprise[reprise.index("--max-turns") + 1] == "6" and "--allowedTools" not in reprise
+        assert infos.index(reprise) == infos.index(premier) + 1        # reprise aussitôt
+
+        # Ce que Claude a reçu : le 3e article n'a plus de place, son début
+        # (titre, auteur) est donné ; la reprise ne l'invite à rien ouvrir.
+        entrees = [e for e in _entrees(tmp, "infos").values() if "@@OUVRE_TOUT@@" in e]
+        assert len(entrees) == 2
+        for e in entrees:
+            assert ('<document type="notes" fichier="Travail de groupe/Article 3.txt" extrait="début">\n'
+                    "Article 3 : Trajectoires du vieillissement cognitif Auteur 3, Université de Liège") in e
+        lecture = [e for e in entrees if "avec l'outil Read" in e]
+        sans = [e for e in entrees if "Ces fichiers ne sont pas à ouvrir" in e]
+        assert len(lecture) == 1 and len(sans) == 1
+        assert "Read" not in sans[0].split("<supports>")[1]
+        assert "[… suite non reproduite]" in sans[0]
+        ateliers = (tmp / "env" / "local" / "Transcriptor" / "atelier").glob("annee-infos-*")
+        sans_copie = [a for a in ateliers if "Ces fichiers ne sont pas à ouvrir"
+                      in (a / "entree_claude.txt").read_text("utf-8")]
+        assert sans_copie and not any((a / "supports").exists() for a in sans_copie)
+
+        # Le journal dit ce qui s'est passé, avec le bon nombre de supports.
+        journal = (racine / "Psycho" / "_Transcriptor" / "claude.log").read_text("utf-8")
+        assert "supports : 4 fichier(s)" in journal
+        appli = (tmp / "env" / "local" / "Transcriptor" / "journal.log").read_text("utf-8")
+        assert re.search(r"Claude a utilisé ses 16 tours sans finir : il a ouvert ou parcouru "
+                         r"3 fichier\(s\) \(01_Plan_du_cours\.notes\.txt, 02_Article_1.*reprise sans ouvrir", appli), appli[-1500:]
+
+
+# Le nom réel d'un enregistrement Plaud de Carole : 191 caractères. Avec
+# « Z:\Bachelier Educateur Carole\Année 1\00 - Audios et horaire\ » devant,
+# l'audio tient (252) mais sa transcription (267, et 275 en « .partiel ») et
+# sa place dans Traités\2026-09 (268) dépassaient les 259 de Windows.
+NOM_LONG = ("09-30 Cours magistral_ Terminologie de la communication professionnelle écrite - "
+            "secteurs marchand_non marchand, écrits professionnels, méthodologies "
+            "d'intervention, Maslow, santé mentale.ogg")
+
+
+def test_noms_trop_longs_pour_windows():
+    """Aucun fichier créé ou déplacé par l'app ne dépasse la limite de
+    Windows : la transcription d'un audio au nom très long reçoit un nom
+    raccourci (et se retrouve ensuite), l'audio n'est pas rangé là où son
+    chemin serait trop long."""
+    assert len(NOM_LONG) == 191
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        tr = _environnement(tmp)
+        racine = _annee(tmp)
+        (racine / AUDIOS[3]).rename(racine / NOM_LONG)
+        audios = racine / "00 - Audios et horaire"
+        limite = tr.an.LIMITE_CHEMIN
+        tr.an.LIMITE_CHEMIN = len(str(audios)) + 1 + (259 - 61)    # même géométrie que sur Z:
+        try:
+            p = tr.Passerelle()
+            p.ouvrir_annee(str(racine))
+            p.lire_horaire_annee({})
+            attendre(p._chantier)
+            p.preparer_dossiers_annee()
+            assert (audios / NOM_LONG).is_file()
+            p.lancer_annee({"modele": "large-v3"})
+            attendre(p._chantier, 300)
+            taches = p._chantier.instantane()["taches"]
+            assert all(x["statut"] == "fait" for x in taches), [x for x in taches if x["statut"] != "fait"]
+
+            # La transcription : nom raccourci, marqué, sous la limite même en « .partiel ».
+            txt = [f for f in (audios / "Transcriptions").rglob("*.txt") if "Terminologie" in f.name]
+            assert len(txt) == 1, txt
+            assert len(str(txt[0])) + len(".partiel") <= tr.an.LIMITE_CHEMIN
+            assert txt[0].name.startswith("09-30 Cours magistral_ Terminologie de la communication")
+            assert txt[0].name.endswith(tr.an.marque_courte(NOM_LONG) + ".txt")
+            assert f"Fichier : {NOM_LONG}" in txt[0].read_text("utf-8")
+
+            # Rangement : les autres audios vont dans Traités, celui-ci reste
+            # en place (son chemin y dépasserait la limite), sans remarque.
+            assert (audios / NOM_LONG).is_file()
+            assert list((audios / "Traités").rglob("*.ogg"))
+            assert not any("pas rangé" in r for r in p._chantier.remarques), p._chantier.remarques
+            for f in racine.rglob("*"):
+                if f.name != NOM_LONG:
+                    assert len(str(f)) <= tr.an.LIMITE_CHEMIN, f
+
+            # Rien n'est refait ensuite.
+            p.lancer_annee({"modele": "large-v3"})
+            attendre(p._chantier, 300)
+            assert not [x for x in p._chantier.instantane()["taches"] if x["genre"] == "transcription"]
+
+            # Rangé ailleurs à la main et registre perdu : la transcription au
+            # nom raccourci est retrouvée par sa marque.
+            (audios / "Septembre").mkdir()
+            (audios / NOM_LONG).rename(audios / "Septembre" / NOM_LONG)
+            (racine / "_Transcriptor" / "registre.json").unlink()
+            a = p._annee
+            analyse = a.analyser()
+            trouve = a.transcriptions(analyse.infos, chercher=True)
+            assert trouve["Septembre/" + NOM_LONG] == txt[0]
+        finally:
+            tr.an.LIMITE_CHEMIN = limite
+
+
+def test_messages_fichier_absent():
+    """« No such file or directory » n'est pas un fichier illisible : le
+    message dit si le chemin est trop long pour Windows ou si le fichier a
+    disparu, et ne parle plus de conversion."""
+    with tempfile.TemporaryDirectory() as t:
+        tr = _environnement(Path(t))
+        long_ = "Z:\\Bachelier Educateur Carole\\Année 1\\00 - Audios et horaire\\Traités\\2026-09\\" + NOM_LONG
+        m = tr._lisible(FileNotFoundError(2, "No such file or directory", long_))
+        assert m.startswith("Chemin trop long pour Windows (268 caractères, 259 au plus) : « 09-30 Cours")
+        assert "Convertis" not in m
+        m = tr._lisible(OSError("[Errno 2] No such file or directory: 'Z:\\\\Année 1\\\\cours.ogg'"))
+        assert m.startswith("Fichier introuvable : « cours.ogg » — déplacé, renommé ou supprimé"), m
+        m = tr._lisible(ValueError("Invalid data found when processing input"))
+        assert m.startswith("Ce fichier n'a pas pu être décodé. Convertis-le en MP3 ou WAV")
+
+
 if __name__ == "__main__":
     test_annee_de_bout_en_bout()
     print("ok bout en bout")
@@ -490,3 +648,9 @@ if __name__ == "__main__":
     print("ok ajouts, rangement, réécriture")
     test_supports_de_cours()
     print("ok supports de cours")
+    test_infos_tours_epuises()
+    print("ok infos : tours épuisés, reprise sans lecture")
+    test_noms_trop_longs_pour_windows()
+    print("ok noms trop longs pour Windows")
+    test_messages_fichier_absent()
+    print("ok messages fichier absent")

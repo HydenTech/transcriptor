@@ -149,3 +149,29 @@ def test_pages_d_un_pdf():
         supports, _ = sup.preparer([tmp / "une.pdf", tmp / "deux.pdf"], tmp / "supports")
         detail = {s.origine: s.detail for s in supports}
         assert detail == {"une.pdf": "≈ 1 page", "deux.pdf": "≈ 2 pages"}
+
+
+def test_documents_sans_place_et_sans_lecture():
+    """Au-delà du budget, un document n'est plus reproduit : son début (titre,
+    auteurs) l'est, pour le citer sans l'ouvrir. Sans lecture, rien n'invite
+    Claude à ouvrir un fichier."""
+    debut = sup.debut_texte("# PDF — nihms-987344.pdf\n\n## Page 1\nTrajectories of normal cognitive "
+                            "aging\nTimothy A. Salthouse\n\nAbstract\n" + "mot " * 400, 120)
+    assert debut.startswith("Trajectories of normal cognitive aging Timothy A. Salthouse Abstract")
+    assert debut.endswith(" […]") and len(debut) <= 125 and "PDF" not in debut and "Page" not in debut
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        sources = []
+        for i in (1, 2, 3):
+            f = tmp / f"Article {i}.txt"
+            f.write_text(f"Titre de l'article {i}\nAuteur {i}\n" + "texte " * 4000, encoding="utf-8")
+            sources.append(f)
+        supports, _ = sup.preparer(sources, tmp / "supports")
+        bloc = sup.bloc_pour_claude(supports, tmp / "supports", budget=30_000)
+        assert bloc.count("[… tronqué : voir le fichier complet avec Read]") == 1
+        assert ('<document type="notes" fichier="Article 3.txt" extrait="début">\n'
+                "Titre de l'article 3 Auteur 3 texte") in bloc
+        assert "seul le début de ces documents est reproduit ; ouvre-les avec Read seulement" in bloc
+        sans = sup.bloc_pour_claude(supports, tmp / "supports", budget=30_000, lecture=False)
+        assert "Read" not in sans and "Ces fichiers ne sont pas à ouvrir" in sans
+        assert "[… suite non reproduite]" in sans and 'extrait="début"' in sans

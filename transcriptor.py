@@ -13,6 +13,7 @@ le corps est envoyé à Claude, l'en-tête `pdf:` règle la mise en page.
 from __future__ import annotations
 
 import datetime
+import errno
 import importlib
 import json
 import os
@@ -1040,6 +1041,11 @@ class ConnexionClaude(RuntimeError):
     propose alors « Se connecter à Claude »."""
 
 
+class ToursEpuises(RuntimeError):
+    """Claude a utilisé tous ses tours (--max-turns) sans livrer de réponse,
+    le plus souvent à ouvrir des documents un à un."""
+
+
 def variables_de_cle() -> list[str]:
     return [v for v in _VARIABLES_CLE if os.environ.get(v, "").strip()]
 
@@ -1444,6 +1450,7 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
     mots = 0
     modele_reel = ""
     demande = commande[commande.index("--model") + 1] if "--model" in commande else ""
+    ouverts: list[str] = []         # fichiers que Claude a ouverts ou parcourus
 
     try:
         for ligne in proc.stdout:  # type: ignore[union-attr]
@@ -1487,6 +1494,8 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
                             t.maj(etape, avancement=mots / (mots + 6000),
                                   detail=f"Rédaction · {cible} · {mots} mots")
                         else:
+                            if b.get("name") in ("Read", "Grep", "Glob"):
+                                ouverts.append(cible or str(entrees.get("pattern") or ""))
                             t.maj(etape, detail="Lecture des supports · "
                                   + (cible or str(b.get("name") or "")))
 
@@ -1576,8 +1585,20 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
         raise _CliObsolete(message or erreurs)
 
     connexion = not garde["motif"] and bool(_RE_CONNEXION.search(message))
+    tours = (not garde["motif"] and not connexion
+             and (str((resultat or {}).get("subtype")) == "error_max_turns"
+                  or bool(re.search(r"maximum number of turns|max_turns", message, re.I))))
     if garde["motif"]:
         message = f"Synthèse interrompue : {garde['motif']}."
+    elif tours:
+        maxi = commande[commande.index("--max-turns") + 1] if "--max-turns" in commande else "?"
+        lus = sorted({o for o in ouverts if o})
+        message = (f"Claude a utilisé ses {maxi} tours sans finir"
+                   + (f" : il a ouvert ou parcouru {len(lus)} fichier(s) ({', '.join(lus[:4])}"
+                      + ("…" if len(lus) > 4 else "") + ")" if lus else "")
+                   + ". " + ("Relance « Tout traiter »." if etape != "synthese" else
+                             "Relance la synthèse ; si ça se reproduit, la transcription est "
+                             "peut-être trop longue pour une seule passe."))
     else:
         message = _expliquer(message, proc.returncode, demande)
 
@@ -1590,7 +1611,7 @@ def _appeler_claude(t: Traitement, commande: list[str], entree: Path,
             pass
     message += f" Détail : {journal.name} dans {lieu}."
     noter(f"claude : échec (code {proc.returncode}) — {message[:300]}")
-    raise (ConnexionClaude if connexion else RuntimeError)(message[:800])
+    raise (ConnexionClaude if connexion else ToursEpuises if tours else RuntimeError)(message[:800])
 
 
 def preparer_atelier(t: Traitement, corps: str, transcription: Path) -> Path:
@@ -1850,6 +1871,14 @@ def consignes_annee(nom: str) -> Path:
     raise FileNotFoundError(f"Consignes « {nom} » introuvables dans {CONSIGNES_ANNEE}.")
 
 
+# La fiche « Infos » se rédige d'après le texte reproduit : ouvrir chaque
+# article pour en lire le titre épuisait les tours de Claude.
+OUVRIR_INFOS = (" N'ouvre un document avec Read que pour y chercher une information pratique "
+                "absente du texte reproduit, comme une date d'examen ou une consigne de travail ; "
+                "pour citer une ressource, le début reproduit suffit.")
+SANS_LECTURE = " N'ouvre aucun fichier : tout ce qui est utile est reproduit dans l'entrée."
+
+
 def consigne_annee(genre: str) -> str:
     """Le prompt de `claude -p` pour une étape du mode année. Pas de chevrons
     ni de guillemets droits : claude.cmd passe par cmd.exe."""
@@ -1867,12 +1896,12 @@ def consigne_annee(genre: str) -> str:
     if genre == "infos":
         return (debut + "matiere ; infos, les informations pratiques relevées séance par séance ; "
                 "supports, les documents de la matière. Rédige la fiche décrite par les consignes."
-                + fin)
+                + OUVRIR_INFOS + fin)
     if genre == "infos_ajout":
         return (debut + "mission, ce que tu dois faire ; infos_actuelles, la fiche telle qu'elle "
                 "est ; matiere ; infos, les informations des nouvelles séances seulement ; "
                 "supports, les nouveaux documents seulement. Réponds par la fiche complète mise "
-                "à jour, en suivant la mission et les consignes." + fin)
+                "à jour, en suivant la mission et les consignes." + OUVRIR_INFOS + fin)
     if genre == "fiches_ajout":
         return (debut + "mission, ce que tu dois faire ; matiere ; notes, les nouvelles séances "
                 "seulement ; supports, les nouveaux documents seulement. Les fiches existantes "
@@ -2239,6 +2268,8 @@ class Chantier:
             try:
                 a.deplacer_audio(info, sous)
                 ranges[sous.split("/")[0]] = ranges.get(sous.split("/")[0], 0) + 1
+            except an.CheminTropLong as exc:
+                noter(f"rangement : {info.nom} laissé en place — {exc}")
             except OSError as exc:
                 self.remarque(f"{info.nom} : pas rangé ({exc})")
         if ranges:
@@ -2500,11 +2531,13 @@ class Chantier:
                 self.remarque(f"{pm.m.titre} : supports non préparés ({_lisible(exc)[:150]})")
 
     def _bloc_supports(self, pm: _PlanMatiere, atelier: Path, budget: int,
-                       seulement: Optional[list[str]] = None) -> str:
-        """Le bloc <supports> d'une matière ; les fichiers que Claude peut lire
-        sont copiés dans l'atelier (son répertoire de travail). `seulement` :
-        les documents à donner (chemins relatifs au dossier de la matière),
-        par défaut tous."""
+                       seulement: Optional[list[str]] = None,
+                       lecture: bool = True) -> tuple[str, list[sup.Support]]:
+        """Le bloc <supports> d'une matière, et les supports qu'il donne ; les
+        fichiers que Claude peut lire sont copiés dans l'atelier (son
+        répertoire de travail). `seulement` : les documents à donner (chemins
+        relatifs au dossier de la matière), par défaut tous. `lecture=False` :
+        Claude n'ouvrira rien, seul leur texte (ou son début) est donné."""
         supports_ = pm.supports or []
         if seulement is not None:
             voulus = set()
@@ -2515,10 +2548,11 @@ class Chantier:
                     pass
             supports_ = [x for x in supports_ if x.source in voulus]
         if not supports_:
-            return ""
+            return "", []
         copie = atelier / "supports"
-        copie.mkdir(parents=True, exist_ok=True)
-        for s in supports_:
+        if lecture:
+            copie.mkdir(parents=True, exist_ok=True)
+        for s in (supports_ if lecture else []):
             for nom in {s.fichier, s.texte} - {""}:
                 try:
                     shutil.copyfile(pm.travail / "supports" / nom, copie / nom)
@@ -2540,9 +2574,9 @@ class Chantier:
                           len(p.relative_to(pm.dossier).parts) if p.is_relative_to(pm.dossier) else 9)
                  for p in pm.sources}
         supports = sorted(supports_, key=lambda s: ordre.get(s.origine, (2, 9)))
-        return sup.bloc_pour_claude(supports, pm.travail / "supports", racine=copie,
-                                    budget=budget, chemins=chemins, roles=roles,
-                                    intro="Documents rangés dans le dossier de la matière")
+        return sup.bloc_pour_claude(supports, pm.travail / "supports", racine=copie if lecture else None,
+                                    budget=budget, chemins=chemins, roles=roles, lecture=lecture,
+                                    intro="Documents rangés dans le dossier de la matière"), supports
 
     def _bloc_matiere(self, pm: _PlanMatiere) -> str:
         m, h = pm.m, self.horaire
@@ -2580,6 +2614,9 @@ class Chantier:
                         self.maj_tache(cle, statut="en_cours", detail="Préparation")
                         self._preparer_supports(pm, cle)
                         try:
+                            if not c.audio.chemin.is_file():
+                                raise FileNotFoundError(errno.ENOENT, "No such file or directory",
+                                                        str(c.audio.chemin))
                             r = transcrire_robuste(
                                 c.audio.chemin, txt, modele=self.options.get("modele") or "large-v3",
                                 matiere=pm.m.nom, termes=pm.m.vocabulaire,
@@ -2824,7 +2861,7 @@ class Chantier:
                 (atelier / nom).write_text(texte, encoding="utf-8")
         blocs_notes = "\n\n".join(f'<seance date="{ps.seance.date or "inconnue"}">\n'
                                   f"{texte.strip()}\n</seance>" for ps, texte in seances)
-        bloc_sup = self._bloc_supports(pm, atelier, BUDGET_SUPPORTS_FICHES, seulement=docs)
+        bloc_sup, remis = self._bloc_supports(pm, atelier, BUDGET_SUPPORTS_FICHES, seulement=docs)
         if ajout:
             quoi = " et ".join(x for x in (
                 f"{len(seances)} séance(s)" if seances else "",
@@ -2848,11 +2885,12 @@ class Chantier:
                                              "Aucune séance enregistrée : rédige à partir des supports."))
             + "\n</notes>\n\n" + (bloc_sup + "\n" if bloc_sup else ""), encoding="utf-8")
         etape = EtapeAnnee(self, cle, pm.travail, self._options_claude(regles), consignes)
-        etape.supports = pm.supports or []
-        lectures = len(sup.a_lire(pm.supports or []))
+        etape.supports = remis
+        # Un tour par fichier écrit ou complété, et de quoi ouvrir chaque
+        # document remis (un long PDF se lit en plusieurs fois).
         reponse, usage = executer_claude(etape, consigne_annee("fiches_ajout" if ajout else "fiches"),
                                          entree, Jalons({}), outils=("Read", "Write", "Edit"),
-                                         tours=min(150, 60 + 2 * lectures))
+                                         tours=min(150, 60 + 3 * len(remis)))
         parties = suivi.parties_dans(atelier)
         md = suivi.assembler(parties) if parties else reponse.strip() + "\n"
         lieu = f"Détail : claude.log dans « {pm.travail} »."
@@ -2903,7 +2941,6 @@ class Chantier:
                 releves.append(f"### Séance du {ps.seance.libelle}\n{infos}"
                                + ("\n\nPoints sur lesquels l'enseignant a insisté :\n" + "\n".join(signaux)
                                   if signaux else ""))
-            bloc_sup = self._bloc_supports(pm, atelier, BUDGET_SUPPORTS_INFOS, seulement=docs)
             ajout = bool(existant.strip())
             tete = ""
             if ajout:
@@ -2912,18 +2949,40 @@ class Chantier:
                     f"{len(docs)} document(s)" if docs else "") if x)
                 tete = ("<mission>\n" + MISSION_AJOUT_INFOS.format(quoi=quoi) + "\n</mission>\n\n"
                         "<infos_actuelles>\n" + existant.strip() + "\n</infos_actuelles>\n\n")
-            entree = atelier / "entree_claude.txt"
-            entree.write_text(
-                "<consignes>\n" + regles.corps.strip() + "\n</consignes>\n\n" + tete
-                + "<matiere>\n" + self._bloc_matiere(pm) + "\n</matiere>\n\n"
-                "<infos>\n" + ("\n\n".join(releves) or ("Aucune nouvelle séance." if ajout
-                                                       else "Aucune séance enregistrée."))
-                + "\n</infos>\n\n" + (bloc_sup + "\n" if bloc_sup else ""), encoding="utf-8")
+
+            def composer(atelier: Path, bloc_sup: str) -> Path:
+                entree = atelier / "entree_claude.txt"
+                entree.write_text(
+                    "<consignes>\n" + regles.corps.strip() + "\n</consignes>\n\n" + tete
+                    + "<matiere>\n" + self._bloc_matiere(pm) + "\n</matiere>\n\n"
+                    "<infos>\n" + ("\n\n".join(releves) or ("Aucune nouvelle séance." if ajout
+                                                           else "Aucune séance enregistrée."))
+                    + "\n</infos>\n\n" + (bloc_sup + "\n" if bloc_sup else ""), encoding="utf-8")
+                return entree
+
+            genre = "infos_ajout" if ajout else "infos"
+            bloc_sup, remis = self._bloc_supports(pm, atelier, BUDGET_SUPPORTS_INFOS, seulement=docs)
             etape = EtapeAnnee(self, ci, pm.travail, self._options_claude(regles), consignes)
-            lectures = len(sup.a_lire(pm.supports or []))
-            md, usage = executer_claude(etape, consigne_annee("infos_ajout" if ajout else "infos"),
-                                        entree, Jalons({}), outils=("Read",) if lectures else (),
-                                        tours=6 + lectures)
+            etape.supports = remis
+            try:
+                # La fiche est une réponse en un message, mais Claude peut ouvrir
+                # quelques documents (fin d'un syllabus tronqué, PDF scanné) :
+                # deux tours par document remis.
+                md, usage = executer_claude(etape, consigne_annee(genre), composer(atelier, bloc_sup),
+                                            Jalons({}), outils=("Read",) if remis else (),
+                                            tours=min(40, 8 + 2 * len(remis)) if remis else 6)
+            except ToursEpuises as exc:
+                # Il a passé ses tours à ouvrir des documents : la fiche est
+                # refaite d'après leur texte reproduit, sans rien ouvrir.
+                noter(f"année : infos {pm.m.nom} — {exc} — reprise sans ouvrir de fichier")
+                self.maj_tache(ci, detail="Reprise d'après le texte des documents")
+                atelier = self._atelier("infos")
+                bloc_sup, _ = self._bloc_supports(pm, atelier, BUDGET_SUPPORTS_INFOS,
+                                                  seulement=docs, lecture=False)
+                md, usage = executer_claude(etape, consigne_annee(genre) + SANS_LECTURE,
+                                            composer(atelier, bloc_sup), Jalons({}), tours=6)
+                self.remarque(f"{pm.m.titre} : infos rédigées d'après le texte des documents, "
+                              "sans les ouvrir (Claude manquait de tours pour les parcourir).")
             if suivi.mots(md) < 30:
                 raise RuntimeError(f"Fiche presque vide ({suivi.mots(md)} mots).")
             if ajout and suivi.mots(md) < 0.6 * suivi.mots(existant):
@@ -3817,9 +3876,24 @@ def _entete_transcription(chemin: Path) -> dict[str, Any]:
 def _lisible(exc: Exception) -> str:
     message = str(exc).strip() or exc.__class__.__name__
     bas = message.lower()
-    if "invalid data" in bas or "moov atom" in bas or "does not contain" in bas \
-            or "no such file" in bas or "av." in bas.split(":")[0]:
-        message = ("Ce fichier n'a pas pu etre decode. Convertis-le en MP3 ou WAV, "
+    if isinstance(exc, FileNotFoundError) or "no such file" in bas:
+        # Un fichier absent n'est pas un fichier illisible : soit il a bougé,
+        # soit son chemin dépasse la limite de Windows (260 caractères).
+        chemin = str(getattr(exc, "filename", None) or "")
+        if not chemin:
+            m = re.search(r"No such file or directory: '(.+)'", message)
+            chemin = m.group(1).replace("\\\\", "\\") if m else ""
+        nom = re.split(r"[\\/]", chemin)[-1] if chemin else ""
+        if len(chemin) > an.LIMITE_CHEMIN:
+            message = (f"Chemin trop long pour Windows ({len(chemin)} caractères, "
+                       f"{an.LIMITE_CHEMIN} au plus) : « {nom[:70]}… ». Raccourcis le nom "
+                       "du fichier, puis relance.")
+        elif nom:
+            message = (f"Fichier introuvable : « {nom[:120]} » — déplacé, renommé ou supprimé "
+                       "pendant le traitement ? Relance.")
+    elif "invalid data" in bas or "moov atom" in bas or "does not contain" in bas \
+            or "av." in bas.split(":")[0]:
+        message = ("Ce fichier n'a pas pu être décodé. Convertis-le en MP3 ou WAV, "
                    "puis relance. (" + message[:120] + ")")
     if "cublas" in bas or "cudnn" in bas:
         message += (" — les bibliothèques CUDA de pip sont introuvables. "

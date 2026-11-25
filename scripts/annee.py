@@ -62,6 +62,38 @@ DOSSIER_ECARTES = "Écartés"       # « pas un cours » et doublons
 FICHES = "Fiches résumés"
 INFOS = "Infos importantes"
 IGNORE = "__ignore__"          # classement manuel : « pas un cours »
+# Windows (sans les « chemins longs » activés) refuse un chemin de plus de 259
+# caractères : « No such file or directory ». Un titre Plaud y arrive vite
+# (191 caractères pour un cours de Terminologie) : les fichiers que l'app crée
+# ou déplace restent en deçà.
+LIMITE_CHEMIN = 259
+SUFFIXE_PARTIEL = ".partiel"   # transcription en cours d'écriture
+
+
+class CheminTropLong(OSError):
+    """Le chemin dépasserait la limite de Windows : rien n'est déplacé."""
+
+
+def nom_tenant(dossier: Path, base: str, fin: str, reserve: int = 0, cle: str = "") -> str:
+    """`base` + `fin` (extension…), `base` raccourcie s'il le faut pour que
+    dossier/nom (+ `reserve` caractères) tienne dans LIMITE_CHEMIN. `cle` :
+    un raccourci reçoit « ~ » et 6 caractères tirés de `cle`, pour que deux
+    noms longs au même début restent distincts et soient retrouvés."""
+    place = LIMITE_CHEMIN - len(str(dossier)) - 1 - reserve - len(fin)
+    if len(base) <= place:
+        return base + fin
+    marque = "~" + hashlib.sha1(cle.encode("utf-8")).hexdigest()[:6] if cle else ""
+    garde = max(16, place - len(marque))
+    coupe = base[:garde]
+    espace = coupe.rfind(" ")
+    if espace > garde // 2:
+        coupe = coupe[:espace]
+    return coupe.rstrip(" .,;-_") + marque + fin
+
+
+def marque_courte(nom: str) -> str:
+    """La marque d'un nom raccourci par nom_tenant (cle=nom)."""
+    return "~" + hashlib.sha1(nom.encode("utf-8")).hexdigest()[:6]
 
 JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
 MOIS = ("janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
@@ -1200,8 +1232,11 @@ class Annee:
         # Deux audios de même nom mais d'extensions différentes : on les distingue.
         jumeaux = [p for p in audio.parent.glob(f"{glob_echappe(audio.stem)}.*")
                    if p.suffix.lower() in EXT_AUDIO and p != audio]
-        nom = f"{audio.stem}{audio.suffix.lower()}.txt" if jumeaux else f"{audio.stem}.txt"
-        return dossier / nom
+        base = f"{audio.stem}{audio.suffix.lower()}" if jumeaux else audio.stem
+        # Un nom trop long pour Windows est raccourci (marque tirée du nom de
+        # l'audio : la transcription se retrouve même après un déplacement).
+        return dossier / nom_tenant(dossier, base, ".txt", reserve=len(SUFFIXE_PARTIEL),
+                                    cle=audio.name)
 
     # -- registre des enregistrements -----------------------------------
     def registre(self) -> dict:
@@ -1272,7 +1307,11 @@ class Annee:
                     if racine_t.is_dir():
                         for t in racine_t.rglob("*.txt"):
                             index.setdefault(t.name.lower(), []).append(t)
-                for nom in (f"{info.chemin.stem}.txt", f"{info.chemin.stem}{info.chemin.suffix}.txt"):
+                            m = re.search(r"(~[0-9a-f]{6})\.txt$", t.name)
+                            if m:
+                                index.setdefault(m.group(1), []).append(t)
+                for nom in (f"{info.chemin.stem}.txt", f"{info.chemin.stem}{info.chemin.suffix}.txt",
+                            marque_courte(info.chemin.name)):
                     for t in index.get(nom.lower(), []):
                         try:
                             tete = t.read_text(encoding="utf-8", errors="replace")[:400]
@@ -1310,8 +1349,13 @@ class Annee:
         Le cache et le registre suivent : rien n'est relu ni retranscrit."""
         base = self.dossier_audios()
         dossier = base.joinpath(*sous.split("/"))
-        dossier.mkdir(parents=True, exist_ok=True)
         dest = dossier / info.chemin.name
+        if len(str(dest)) + 4 > LIMITE_CHEMIN:          # « (2) » éventuel compris
+            # Plus profond, son chemin dépasserait la limite de Windows : il
+            # reste où il est (le renommer changerait son titre, qui sert au
+            # classement).
+            raise CheminTropLong(f"chemin trop long pour « {sous} » ({len(str(dest))} caractères)")
+        dossier.mkdir(parents=True, exist_ok=True)
         n = 2
         while dest.exists():
             dest = dossier / f"{info.chemin.stem} ({n}){info.chemin.suffix}"
@@ -1423,6 +1467,11 @@ class Annee:
             dest = cible / p.name
             if dest.exists():
                 messages.append(f"{p.name} : déjà présent dans « {cible.name} », laissé à la racine")
+                continue
+            if len(str(dest)) > LIMITE_CHEMIN:
+                messages.append(f"{p.name[:60]}… : nom trop long pour Windows dans « {cible.name} » "
+                                f"({len(str(dest))} caractères, {LIMITE_CHEMIN} au plus), laissé à la "
+                                "racine — raccourcis son nom")
                 continue
             shutil.move(str(p), str(dest))
             messages.append(f"{p.name} → {cible.name}")

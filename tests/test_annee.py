@@ -315,3 +315,20 @@ if __name__ == "__main__":
         if nom.startswith("test_") and inspect.isfunction(f):
             f()
             print("ok", nom)
+
+
+def test_noms_tenant_dans_la_limite_de_windows():
+    """nom_tenant : inchangé s'il tient ; sinon coupé à un espace, marqué,
+    extension gardée, réserve (« .partiel ») comprise."""
+    dossier = Path("Z:/Bachelier Educateur Carole/Année 1/00 - Audios et horaire/Transcriptions")
+    assert annee.nom_tenant(dossier, "2026-09-08 08_33_08", ".txt", reserve=8) == "2026-09-08 08_33_08.txt"
+    base = ("09-30 Cours magistral_ Terminologie de la communication professionnelle écrite - "
+            "secteurs marchand_non marchand, écrits professionnels, méthodologies "
+            "d'intervention, Maslow, santé mentale")
+    nom = annee.nom_tenant(dossier, base, ".txt", reserve=8, cle=base + ".ogg")
+    assert len(str(dossier / nom)) + 8 <= annee.LIMITE_CHEMIN
+    assert nom.endswith(annee.marque_courte(base + ".ogg") + ".txt")
+    coupe = nom[:-len("~xxxxxx.txt")]
+    assert base.startswith(coupe) and base[len(coupe)] in " ,"     # coupé entre deux mots
+    # Même dossier, même nom : même résultat (la transcription se retrouve).
+    assert annee.nom_tenant(dossier, base, ".txt", reserve=8, cle=base + ".ogg") == nom

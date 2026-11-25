@@ -54,6 +54,8 @@ EXT_SUPPORTS = EXT_IMAGE | EXT_DIAPOS | EXT_NOTES | EXT_DOCUMENTS | set(A_CONVER
 COTE_MAX = 1600            # px, plus grand côté des images envoyées
 IMAGES_PAR_PPTX = 40       # au-delà, on garde les plus grandes
 TEXTE_MAX = 60_000         # caractères transmis en ligne par document
+APERCU = 700               # début d'un document dont le texte n'a plus de place
+APERCUS_MAX = 30           # au-delà, ces documents sont seulement listés
 MANIFESTE = "manifeste.json"
 LISIBLES_PAR_CLAUDE = ("photo", "image_diapo", "pdf")   # à lire avec l'outil Read
 
@@ -598,28 +600,49 @@ CONSIGNE_ROLES = ("Un syllabus (notes de cours ou plan de cours de l'enseignant,
                   "été dit en séance les complète (exemples, explications, insistances).")
 
 
+def debut_texte(texte: str, n: int = APERCU) -> str:
+    """Le début d'un texte extrait (titre, auteurs, résumé…) en une ligne,
+    sans les repères ajoutés à l'extraction (« # PDF — », « ## Page 3 »)."""
+    morceaux = []
+    for ligne in texte.splitlines():
+        ligne = ligne.strip()
+        if not ligne or re.match(r"#+ (PDF|Document|Diapositives?|Page)\b", ligne):
+            continue
+        morceaux.append(ligne)
+        if sum(len(m) + 1 for m in morceaux) > n:
+            break
+    debut = " ".join(morceaux)
+    if len(debut) > n:
+        debut = debut[:n].rsplit(" ", 1)[0] + " […]"
+    return debut
+
+
 def bloc_pour_claude(supports: list[Support], dossier: Path, *,
                      debut: Optional[datetime.datetime] = None, duree: float = 0,
                      racine: Optional[Path] = None, budget: Optional[int] = None,
                      chemins: Optional[dict[str, str]] = None,
                      intro: str = "Supports fournis avec l'enregistrement",
-                     roles: Optional[dict[str, str]] = None) -> str:
+                     roles: Optional[dict[str, str]] = None, lecture: bool = True) -> str:
     """Le bloc <supports> placé dans l'entrée de Claude : la liste des
     fichiers à lire, et le texte des diapositives et notes en clair.
 
     `budget` : nombre total de caractères de texte reproduits (mode année,
     où une matière peut avoir beaucoup de documents) ; au-delà, le document
-    est seulement listé, à lire avec Read si besoin. `chemins` : nom du
-    fichier d'origine -> chemin relatif à montrer (sous-dossier de la matière)."""
+    est seulement listé avec son début (titre, auteurs…), à lire avec Read si
+    besoin. `chemins` : nom du fichier d'origine -> chemin relatif à montrer
+    (sous-dossier de la matière). `lecture=False` : Claude n'ouvrira aucun
+    fichier, le bloc ne l'y invite pas."""
     if not supports:
         return ""
     chemins = chemins or {}
     roles = roles or {}
     lignes = ["<supports>",
-              f"{intro}, dans le dossier supports/ du "
-              "répertoire courant" + (f" (chemin complet : {racine})" if racine else "")
-              + ". Les photos, images et PDF sont à lire avec l'outil Read ; "
-              "le texte des diapositives et des notes est reproduit plus bas."]
+              (f"{intro}, dans le dossier supports/ du répertoire courant"
+               + (f" (chemin complet : {racine})" if racine else "")
+               + ". Les photos, images et PDF sont à lire avec l'outil Read ; le texte des "
+               "diapositives et des notes est reproduit plus bas.") if lecture else
+              (f"{intro}. Ces fichiers ne sont pas à ouvrir : leur texte, ou son début, est "
+               "reproduit plus bas ; les photos et les PDF sans texte ne sont pas lisibles ici.")]
     if any(roles.get(s.origine) for s in supports):
         lignes.append(CONSIGNE_ROLES)
     lignes.append("")
@@ -638,8 +661,9 @@ def bloc_pour_claude(supports: list[Support], dossier: Path, *,
         elif s.genre == "pdf":
             lignes.append(f"- {chemin} — PDF « {chemins.get(s.origine, s.origine)} »"
                           + (f", {s.detail}" if s.detail else "")
-                          + (" (texte reproduit ci-dessous ; à lire avec Read seulement pour ses "
-                             "schémas ou images)" if s.texte else ""))
+                          + ((" (texte reproduit ci-dessous ; à lire avec Read seulement pour ses "
+                              "schémas ou images)" if lecture else " (texte reproduit ci-dessous)")
+                             if s.texte else ""))
         elif s.genre == "document":
             lignes.append(f"- {chemin} — document Word « {chemins.get(s.origine, s.origine)} » "
                           "(texte reproduit ci-dessous)")
@@ -657,6 +681,7 @@ def bloc_pour_claude(supports: list[Support], dossier: Path, *,
 
     reste = budget
     omis: list[str] = []
+    apercus: list[str] = []
     for s in supports:
         if s.genre not in ("diapos", "notes", "document") and not (s.genre == "pdf" and s.texte):
             continue
@@ -665,23 +690,31 @@ def bloc_pour_claude(supports: list[Support], dossier: Path, *,
             texte = (dossier / fichier).read_text(encoding="utf-8", errors="replace")
         except Exception:  # noqa: BLE001
             continue
-        limite = TEXTE_MAX if reste is None else min(TEXTE_MAX, reste)
-        if limite < 2000:
-            omis.append(f"supports/{fichier}")
-            continue
-        if len(texte) > limite:
-            texte = texte[:limite] + "\n[… tronqué : voir le fichier complet avec Read]"
-        if reste is not None:
-            reste -= len(texte)
         genre = {"diapos": "diapositives", "notes": "notes", "document": "document Word",
                  "pdf": "texte d'un PDF"}[s.genre]
         if roles.get(s.origine) == "syllabus":
             genre = "syllabus — " + genre
-        lignes += ["", f'<document type="{genre}" fichier="{chemins.get(s.origine, s.origine)}">',
-                   texte.strip(), "</document>"]
+        nom = chemins.get(s.origine, s.origine)
+        limite = TEXTE_MAX if reste is None else min(TEXTE_MAX, reste)
+        if limite < 2000:
+            # Plus de place pour le texte : son début (titre, auteurs, résumé)
+            # suffit à le citer et à juger s'il faut l'ouvrir.
+            omis.append(f"supports/{fichier}")
+            if len(omis) <= APERCUS_MAX:
+                apercus += ["", f'<document type="{genre}" fichier="{nom}" extrait="début">',
+                            debut_texte(texte), "</document>"]
+            continue
+        if len(texte) > limite:
+            texte = texte[:limite] + ("\n[… tronqué : voir le fichier complet avec Read]" if lecture
+                                      else "\n[… suite non reproduite]")
+        if reste is not None:
+            reste -= len(texte)
+        lignes += ["", f'<document type="{genre}" fichier="{nom}">', texte.strip(), "</document>"]
     if omis:
-        lignes += ["", "Faute de place, le texte de ces documents n'est pas reproduit ; lis-les "
-                       "avec Read si la matière l'exige : " + ", ".join(omis)]
+        lignes += apercus + ["", ("Faute de place, seul le début de ces documents est reproduit ; "
+                                  "ouvre-les avec Read seulement si la tâche l'exige : " if lecture
+                                  else "Faute de place, seul le début de ces documents est "
+                                  "reproduit : ") + ", ".join(omis)]
     lignes.append("</supports>")
     return "\n".join(lignes)
 
